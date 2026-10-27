@@ -1,0 +1,20 @@
+{
+  "name": "somestoken-local",
+  "interface": {
+    "displayName": "SomesToken Local"
+  },
+  "plugins": [
+    {
+      "name": "somestoken",
+      "source": {
+        "source": "local",
+        "path": "./plugins/somestoken"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

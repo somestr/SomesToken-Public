@@ -1,0 +1,20 @@
+{
+  "name": "somestoken",
+  "version": "0.6.0-beta.120",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "doctor": "node scripts/doctor.mjs",
+    "setup": "node scripts/setup.mjs",
+    "build": "node scripts/build.mjs",
+    "package:check": "node scripts/package-check.mjs",
+    "optimization": "node plugins/somestoken/bin/optimization.mjs",
+    "limit-recovery": "node plugins/somestoken/bin/codex-limit-recovery.mjs",
+    "console": "node plugins/somestoken/bin/console.mjs",
+    "evidence": "node plugins/somestoken/bin/evidence.mjs"
+  }
+}

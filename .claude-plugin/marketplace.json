@@ -1,0 +1,15 @@
+{
+  "name": "somestoken-local",
+  "owner": {
+    "name": "Somestr"
+  },
+  "description": "Local-first token receipts and evidence-gated efficiency advice for Codex and Claude Code.",
+  "plugins": [
+    {
+      "name": "somestoken",
+      "source": "./plugins/somestoken",
+      "description": "Local-first token receipts and evidence-gated efficiency advice for Codex and Claude Code.",
+      "version": "0.6.0-beta.120"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "somestoken-local-reporting": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs",
+        "--stdio"
+      ],
+    "env": {
+      "PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
+      "PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+      "SOMESTOKEN_RUNTIME": "claude"
+    }
+    }
+  }
+}

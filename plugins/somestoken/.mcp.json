@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "somestoken-local-reporting": {
+      "title": "SomesToken",
+      "description": "Read-only bounded local SomesToken usage and quality reports for Codex and Claude Code.",
+      "command": "node",
+      "args": [
+        "./mcp/server.mjs",
+        "--stdio"
+      ],
+      "cwd": "."
+    }
+  }
+}

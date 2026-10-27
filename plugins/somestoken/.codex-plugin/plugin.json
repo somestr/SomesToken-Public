@@ -1,0 +1,34 @@
+{
+  "name": "somestoken",
+  "version": "0.6.0-beta.120+codex.20261027201611",
+  "description": "Local task, model and token tracking, opt-in efficiency guidance, and evidence-gated comparisons for Codex and Claude Code.",
+  "author": {
+    "name": "Somestr"
+  },
+  "license": "MIT",
+  "hooks": "./hooks/codex-hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "SomesToken",
+    "composerIcon": "./assets/somestoken-icon.png",
+    "logo": "./assets/somestoken-icon.png",
+    "logoDark": "./assets/somestoken-icon.png",
+    "shortDescription": "Local token receipts and advice for Codex + Claude Code",
+    "longDescription": "Reports numerical token usage, calculated provider usage, plan coverage, capability provenance, structural metrics, fixed candidate advice, and Codex limit state through a read-only local contract; the separate recovery companion is explicitly opt-in and never changes ordinary host hooks.",
+    "developerName": "Somestr",
+    "category": "Productivity",
+    "capabilities": [
+      "Lifecycle hooks",
+      "Local reporting skill",
+      "Read-only local reporting MCP",
+      "Local routing advice",
+      "Evidence-gated efficiency advisor",
+      "Evidence-gated optimization lab",
+      "Report-only shadow policy"
+    ],
+    "defaultPrompt": [
+      "Use SomesToken to show the last completed turn.",
+      "Use SomesToken to recommend a model and reasoning effort for a bounded task."
+    ]
+  }
+}
