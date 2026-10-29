@@ -1,11 +1,11 @@
 {
   "name": "somestoken",
-  "version": "0.6.0-beta.121",
+  "version": "0.6.0-beta.122",
   "private": true,
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "scripts": {
     "doctor": "node scripts/doctor.mjs",

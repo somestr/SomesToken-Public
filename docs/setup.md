@@ -1,6 +1,6 @@
 # Setup and verification
 
-SomesToken runs locally on Node.js 18 or newer. Run these commands from the SomesToken folder, not from a project you want to observe. Your projects do not need SomesToken as a dependency.
+SomesToken runs locally on Node.js 24 or newer. Run these commands from the SomesToken folder, not from a project you want to observe. Your projects do not need SomesToken as a dependency.
 
 ## Get the source
 

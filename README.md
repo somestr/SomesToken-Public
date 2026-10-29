@@ -38,7 +38,7 @@ These points are covered by a private automated test suite that uses synthetic d
 ## Requirements
 
 - macOS (validated on Apple silicon).
-- Node.js 18 or newer. Reading compressed Codex sessions needs Node.js 22.15 or newer on 22.x, or 23.8 or newer.
+- Node.js 24 or newer.
 - Codex Desktop or CLI, Claude Code, or both.
 - No `npm install`: the runtime has no dependencies.
 

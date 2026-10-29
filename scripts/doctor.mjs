@@ -153,7 +153,7 @@ export function runDoctor(root = REPO_ROOT, options = {}) {
   checks.push(check('hook_commands', safeHooks ? 'pass' : 'fail', safeHooks ? 'Codex hook commands use the plugin-root compatibility fallback' : 'Codex hook command is not host-safe'));
 
   const nodeMajor = Number(process.versions.node.split('.')[0]);
-  checks.push(check('node_runtime', Number.isInteger(nodeMajor) && nodeMajor >= 18 ? 'pass' : 'fail', Number.isInteger(nodeMajor) && nodeMajor >= 18 ? 'Node runtime meets package floor' : 'Node runtime is below package floor'));
+  checks.push(check('node_runtime', Number.isInteger(nodeMajor) && nodeMajor >= 24 ? 'pass' : 'fail', Number.isInteger(nodeMajor) && nodeMajor >= 24 ? 'Node runtime meets package floor' : `Node.js 24 or newer is required; found ${process.versions.node}`));
 
   if (options.checkCodex === false) {
     checks.push(check('codex_cli', 'unavailable', 'Codex CLI check skipped'));

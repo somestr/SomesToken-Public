@@ -46,6 +46,9 @@ export const MAX_AGENTS_PER_TURN = 32;
 const MAX_CLAUDE_FINAL_SNAPSHOTS = MAX_TURNS;
 
 export const CLAUDE_FINAL_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+// Claude counters count each response once (beta 122). The per-line
+// 'claude_full_v1' counters of earlier releases are rebased, never subtracted.
+export const CLAUDE_ACCOUNTING_BASIS = 'claude_response_v1';
 
 const USAGE_STATE_SCHEMA_VERSION = 1;
 
@@ -295,6 +298,7 @@ function boundedClaudeFinalSnapshots(value, now = timestamp()) {
       ...(typeof entry.lifecycle_turn_id === 'string' && /^[a-f0-9]{20}$/.test(entry.lifecycle_turn_id)
         ? { lifecycle_turn_id: entry.lifecycle_turn_id } : {}),
       usage: tokenFields(usage),
+      ...(entry.accounting_basis === CLAUDE_ACCOUNTING_BASIS ? { accounting_basis: entry.accounting_basis } : {}),
       compaction_count: Number.isSafeInteger(entry.compaction_count) && entry.compaction_count >= 0
         ? Math.min(entry.compaction_count, MAX_HEALTH_COUNTER) : 0,
       staged_at: stagedAt,
@@ -651,7 +655,7 @@ export function recoverState(value, options = {}) {
       usage,
       metadata: persistedMetadata(entry.metadata),
       ponytail: persistedPonytail(entry.ponytail),
-      ...(['claude_full_v1','structured_hook_v1'].includes(entry.accounting_basis) ? { accounting_basis:entry.accounting_basis } : {}),
+      ...(['claude_full_v1',CLAUDE_ACCOUNTING_BASIS,'structured_hook_v1'].includes(entry.accounting_basis) ? { accounting_basis:entry.accounting_basis } : {}),
       compaction_count: Number.isSafeInteger(entry.compaction_count) && entry.compaction_count >= 0 ? entry.compaction_count : 0,
       updated_at: persistedTime(entry.updated_at),
     };

@@ -46,6 +46,7 @@ import {
   MAX_TURNS,
   MAX_AGENTS_PER_TURN,
   CLAUDE_FINAL_SNAPSHOT_TTL_MS,
+  CLAUDE_ACCOUNTING_BASIS,
   MAX_USAGE_SNAPSHOTS,
   MAX_QUOTA_SNAPSHOTS,
   MAX_SESSION_TOTALS,
@@ -329,6 +330,7 @@ function stageClaudeFinalSnapshot(state, input) {
     session_generation: generation,
     ...(lifecycleTurn ? { lifecycle_turn_id: lifecycleTurn } : {}),
     usage: tokenFields(usage),
+    accounting_basis: CLAUDE_ACCOUNTING_BASIS,
     compaction_count: Number.isSafeInteger(source.parsed.compactions) && source.parsed.compactions >= 0
       ? Math.min(source.parsed.compactions, MAX_HEALTH_COUNTER) : 0,
     staged_at: timestamp(),
@@ -378,6 +380,7 @@ function takeClaudeFinalSnapshot(state, input, turnId) {
       || staged.session !== session
       || staged.source_id !== sourceId
       || staged.session_generation !== generation
+      || staged.accounting_basis !== CLAUDE_ACCOUNTING_BASIS
       || !Number.isSafeInteger(staged.staged_at)
       || (now >= staged.staged_at && now - staged.staged_at > CLAUDE_FINAL_SNAPSHOT_TTL_MS)) continue;
     const usage = persistedUsage(staged.usage, 'claude');
@@ -528,11 +531,11 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
     usage: current,
     metadata: mergeRuntimeMetadata(prior?.metadata, parsed.metadata),
     ponytail: parsed.ponytail,
-    ...(identity.runtime === 'claude' ? { accounting_basis:'claude_full_v1' } : {}),
+    ...(identity.runtime === 'claude' ? { accounting_basis:CLAUDE_ACCOUNTING_BASIS } : {}),
     compaction_count: parsed.compactions,
     updated_at: timestamp(),
   };
-  if (identity.runtime === 'claude' && prior && prior.accounting_basis !== 'claude_full_v1') {
+  if (identity.runtime === 'claude' && prior && prior.accounting_basis !== CLAUDE_ACCOUNTING_BASIS) {
     return {valid:false,ambiguous:true,reason:'identity-rebaseline',current,metadata:parsed.metadata};
   }
   if (identity.runtime === 'codex' && parsed.ledger?.present && identity.turn_id) {

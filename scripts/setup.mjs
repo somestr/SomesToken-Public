@@ -135,7 +135,8 @@ function inspectPackage(root, host = 'codex') {
   checks.push(check(
     'package_validation',
     doctor.summary.fail === 0 ? 'pass' : 'fail',
-    doctor.summary.fail === 0 ? 'repository package and manifests validated' : 'repository package validation failed',
+    doctor.summary.fail === 0 ? 'repository package and manifests validated'
+      : `repository package validation failed: ${doctor.checks.filter((entry) => entry.status === 'fail').map((entry) => entry.name).join(', ')}`,
   ));
 
   const marketplace = readJson(root, '.agents/plugins/marketplace.json');

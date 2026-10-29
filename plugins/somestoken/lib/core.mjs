@@ -503,6 +503,7 @@ export function parseTokenSnapshots(text) {
   const snapshots = [];
   const claudeSnapshots = [];
   const codexSnapshots = [];
+  const claudeResponses = new Map();
   let malformed = 0;
   let unknown = 0;
   let compactions = 0;
@@ -532,6 +533,15 @@ export function parseTokenSnapshots(text) {
       const snapshot = { usage: claudeUsage };
       snapshots.push(snapshot);
       claudeSnapshots.push(snapshot);
+      // Claude writes one line per content block and repeats the response's usage
+      // on each. Count a response once, keyed as the feed keys it (claude-capture.mjs):
+      // message id, else line uuid. The last copy counts; differing copies make the
+      // total inconsistent instead of adding up.
+      if (event.isApiErrorMessage !== true && event.isSynthetic !== true && event.message?.model !== '<synthetic>') {
+        const id = event.message?.id ?? event.uuid, key = typeof id === 'string' && id ? id : snapshot;
+        const previous = claudeResponses.get(key);
+        claudeResponses.set(key, previous && JSON.stringify(previous) !== JSON.stringify(claudeUsage) ? { ...claudeUsage, consistent: false } : claudeUsage);
+      }
     } else if (usage) {
       const snapshot = { usage };
       snapshots.push(snapshot);
@@ -553,7 +563,7 @@ export function parseTokenSnapshots(text) {
   }
   const runtime = claudeSnapshots.length && !codexSnapshots.length ? 'claude' : 'codex';
   const latest = runtime === 'claude'
-    ? { usage: sumUsage(claudeSnapshots.map((snapshot) => snapshot.usage)) }
+    ? { usage: sumUsage([...claudeResponses.values()]) }
     : codexSnapshots.at(-1) ?? null;
   return {
     parser_version: PARSER_VERSION,
