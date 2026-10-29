@@ -5,6 +5,7 @@ import { captureTaskForecastProfile } from './task-profiles.mjs';
 import { workspaceDirectory, readWorkspaceFile } from './workspace-usage.mjs';
 import { configuredCodexLedgerRoot } from './codex-ledger.mjs';
 import { configuredClaudeWorkspaceRoot } from './claude-workspace.mjs';
+import { prefixCheck, prefixDigest, TRANSCRIPT_CEILING_BYTES } from './claude-capture.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { releaseFileLock } from './monitor-lock.mjs';
@@ -112,7 +113,7 @@ function telemetryOutcomeForReason(reason) {
   if (reason === 'unsupported-transcript') return 'token_snapshot_missing';
   if (reason === 'counter-reset' || reason === 'bounded-tail-without-baseline'
     || reason === 'inconsistent-total' || reason === 'source-mismatch') return 'transcript_ambiguous';
-  if (reason === 'identity-rebaseline') return 'identity_rebaseline';
+  if (reason === 'identity-rebaseline' || reason === 'checkpoint-rebaseline') return 'identity_rebaseline';
   return 'awaiting_post_turn_usage';
 }
 
@@ -222,29 +223,86 @@ export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
   }
 }
 
-function readSnapshots(filePath, runtime = 'codex') {
-  if (runtime === 'claude') {
-    // Claude entries are per-message usage, unlike Codex cumulative snapshots.
-    // A moving tail is never a cumulative source. Fail open beyond the bound.
-    let fd;
-    try {
-      fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-      const before = fs.fstatSync(fd);
-      if (!before.isFile() || before.size > 64 * 1024 * 1024) throw new Error('claude-source-bound');
-      const buffer = Buffer.alloc(before.size);
-      let offset = 0;
-      while (offset < buffer.length) {
-        const n = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
-        if (!n) throw new Error('short-read');
-        offset += n;
-      }
-      const after = fs.fstatSync(fd);
-      if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new Error('source-changed');
-      return { unreadable:false, truncated:false, parsed:parseTokenSnapshots(buffer.toString('utf8')) };
-    } catch {
-      return { unreadable:true, truncated:false, parsed:parseTokenSnapshots('') };
-    } finally { if (fd !== undefined) fs.closeSync(fd); }
+const CLAUDE_READ_BYTES = 64 * 1024 * 1024;
+const CLAUDE_CHECKPOINT_FROM_BYTES = 32 * 1024 * 1024;
+const CLAUDE_TAIL_BYTES = 4 * 1024 * 1024;
+const snapshotCount = (parsed) => parsed?.snapshot_count ?? parsed?.snapshots?.length ?? 0;
+
+function readRange(fd, start, length) {
+  const buffer = Buffer.alloc(length);
+  for (let offset = 0; offset < length;) {
+    const n = fs.readSync(fd, buffer, offset, length - offset, start + offset);
+    if (!n) throw new Error('short-read');
+    offset += n;
   }
+  return buffer;
+}
+
+const mergedPonytail = (base, added) => base
+  ? { ...(added.mode ? added : base), coverage_count: base.coverage_count + added.coverage_count } : added;
+
+function claudeCheckpoint(stat, size, crc32, absolute, view) {
+  return { basis:CLAUDE_ACCOUNTING_BASIS, size, dev:stat.dev, ino:stat.ino, crc32, absolute,
+    usage:view.latest?.usage ?? sumUsage([]), usage_lines:snapshotCount(view), compactions:view.compactions,
+    ponytail:view.ponytail, boundary:view.claude_tail };
+}
+
+// Claude entries are per-message usage, unlike Codex cumulative snapshots. A
+// transcript up to 64 MiB is parsed whole; past 32 MiB the read also leaves a
+// checkpoint: file identity, CRC32 of the prefix (the feed's check), the
+// cumulative counters and the last responses. A larger transcript is read from
+// that checkpoint, parsing at most 64 MiB of appended bytes. Without a valid
+// checkpoint the counter is rebased once; the next turn is exact again.
+function readClaudeSnapshots(filePath, checkpoint) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > TRANSCRIPT_CEILING_BYTES) throw new Error('claude-source-bound');
+    const base = checkpoint?.basis === CLAUDE_ACCOUNTING_BASIS ? checkpoint : null;
+    if (stat.size <= CLAUDE_READ_BYTES) {
+      const buffer = readRange(fd, 0, stat.size);
+      const after = fs.fstatSync(fd);
+      if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) throw new Error('source-changed');
+      const parsed = parseTokenSnapshots(buffer.toString('utf8')), end = buffer.lastIndexOf(10) + 1;
+      // A counter rebased past 64 MiB is not this file's total: return to it once.
+      return { unreadable:false, truncated:false, rebaseline:base?.absolute === false, parsed,
+        nextCheckpoint:stat.size > CLAUDE_CHECKPOINT_FROM_BYTES
+          ? claudeCheckpoint(stat, end, prefixCheck().update(buffer.subarray(0, end)).digest('hex'), true, parsed) : null };
+    }
+    if (base && base.dev === stat.dev && base.ino === stat.ino && base.size <= stat.size
+      && stat.size - base.size <= CLAUDE_READ_BYTES && prefixDigest(fd, base.size).digest('hex') === base.crc32) {
+      const appended = readRange(fd, base.size, stat.size - base.size), end = appended.lastIndexOf(10) + 1;
+      const parsed = parseTokenSnapshots(appended.subarray(0, end).toString('utf8'), { claudeSeed:base.boundary });
+      const added = parsed.latest
+        ? deltaUsage(sumUsage(base.boundary.map((entry) => entry.usage)), parsed.latest.usage) : sumUsage([]);
+      if (added) {
+        const view = { ...parsed, runtime:'claude', supported:true, latest:{ usage:sumUsage([base.usage, added]) },
+          snapshot_count:base.usage_lines + parsed.snapshots.length, compactions:base.compactions + parsed.compactions,
+          ponytail:mergedPonytail(base.ponytail, parsed.ponytail) };
+        const crc32 = prefixCheck(Number.parseInt(base.crc32, 16)).update(appended.subarray(0, end)).digest('hex');
+        return { unreadable:false, truncated:false, parsed:view,
+          nextCheckpoint:claudeCheckpoint(stat, base.size + end, crc32, base.absolute, view) };
+      }
+    }
+    // Rebase at the last complete line. Its prefix is checked, not parsed; the
+    // last responses come from the tail.
+    const start = Math.max(0, stat.size - CLAUDE_TAIL_BYTES), tail = readRange(fd, start, stat.size - start);
+    const first = start ? tail.indexOf(10) + 1 : 0, last = tail.lastIndexOf(10) + 1;
+    if (last <= first) throw new Error('claude-tail-without-line');
+    const parsed = parseTokenSnapshots(tail.subarray(first, last).toString('utf8'), { claudeSeed:[] });
+    const view = { ...parsed, runtime:'claude', supported:true, latest:{ usage:base?.usage ?? sumUsage([]) },
+      snapshot_count:(base?.usage_lines ?? 0) + parsed.snapshots.length, compactions:base?.compactions ?? 0,
+      ponytail:mergedPonytail(base?.ponytail, parsed.ponytail) };
+    return { unreadable:false, truncated:false, rebaseline:true, parsed:view,
+      nextCheckpoint:claudeCheckpoint(stat, start + last, prefixDigest(fd, start + last).digest('hex'), false, view) };
+  } catch {
+    return { unreadable:true, truncated:false, parsed:parseTokenSnapshots('') };
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function readSnapshots(filePath, runtime = 'codex', checkpoint = null) {
+  if (runtime === 'claude') return readClaudeSnapshots(filePath, checkpoint);
   const tail = readTranscriptTail(filePath);
   if (tail.unreadable) return { ...tail, parsed: parseTokenSnapshots('') };
   return { ...tail, parsed: parseTokenSnapshots(tail.text) };
@@ -279,11 +337,9 @@ function stopTurnIdentity(state, input, snapshot, runtime) {
   if (runtime === 'claude') {
     const promptOrdinal = claudePromptOrdinal(state, input);
     if (promptOrdinal !== null) return turnIdentity(runtime, input?.session_id, `claude-prompt:${promptOrdinal}`, generation, 'main', mainSourceId);
-    const snapshotCount = snapshot?.parsed?.snapshots?.length ?? 0;
-    return turnIdentity(runtime, input?.session_id, `claude:${snapshotCount}`, generation, 'main', mainSourceId);
+    return turnIdentity(runtime, input?.session_id, `claude:${snapshotCount(snapshot?.parsed)}`, generation, 'main', mainSourceId);
   }
-  const snapshotCount = snapshot?.parsed?.snapshots?.length ?? 0;
-  return turnIdentity(runtime, input?.session_id, `codex:${snapshotCount}`, generation, 'main', mainSourceId);
+  return turnIdentity(runtime, input?.session_id, `codex:${snapshotCount(snapshot?.parsed)}`, generation, 'main', mainSourceId);
 }
 
 function claudePromptSnapshotIdentity(state, input, generation, session) {
@@ -298,12 +354,13 @@ function stageClaudeFinalSnapshot(state, input) {
   // display from either is not safely attributable to the main Stop, so field
   // presence alone suppresses staging without inspecting or retaining it.
   if (Object.hasOwn(input ?? {}, 'agent_id')) return null;
-  const source = readSnapshots(input?.transcript_path, 'claude');
-  // A bounded tail without its own baseline cannot identify a complete turn.
-  // Waiting for Stop remains safer than turning that partial file view into a
-  // counter source.
-  if (source.unreadable || source.truncated || !source.parsed?.latest?.usage) return null;
   const generation = sessionGeneration(state, input, 'claude');
+  const mainKey = threadIdentity('main', sourceIdentity('claude', input?.session_id, 'main', generation));
+  const source = readSnapshots(input?.transcript_path, 'claude', state.threads[mainKey]?.checkpoint);
+  // A bounded tail without its own baseline cannot identify a complete turn,
+  // and a rebased counter is not one either. Waiting for Stop remains safer
+  // than turning that partial file view into a counter source.
+  if (source.unreadable || source.truncated || source.rebaseline || !source.parsed?.latest?.usage) return null;
   const suppliedTurnId = safeOpaqueHostIdentifier(input?.turn_id);
   // A session generation after an explicit reopen can receive delayed command
   // hooks from the prior generation. Prompt ordinals restart in the new
@@ -512,9 +569,9 @@ function hookMetadata(input, role) {
 
 function updateThread(state, key, transcriptPath, sourceId, sourceOverride = null, identity = {}) {
   const prior = state.threads[key];
-  const source = sourceOverride ?? readSnapshots(transcriptPath, identity.runtime);
+  const source = sourceOverride ?? readSnapshots(transcriptPath, identity.runtime, prior?.checkpoint);
   const parsed = source.parsed;
-  incrementHealth(state, 'token_events_seen', parsed.snapshots.length);
+  incrementHealth(state, 'token_events_seen', snapshotCount(parsed));
   incrementHealth(state, 'malformed_events', parsed.malformed);
   if (source.unreadable || !parsed.latest) {
     return { valid: false, ambiguous: false, reason: source.unreadable ? 'transcript-unavailable' : 'unsupported-transcript', metadata: prior?.metadata, ponytail: parsed.ponytail };
@@ -524,6 +581,8 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
   const delta = deltaUsage(previous, current);
   const reset = Boolean(previous && delta === null);
   const compactionBoundary = parsed.compactions > (prior?.compaction_count ?? 0);
+  // Only a read that commits the thread moves its checkpoint; a staged source keeps it.
+  const checkpoint = Object.hasOwn(source, 'nextCheckpoint') ? source.nextCheckpoint : prior?.checkpoint;
   state.threads[key] = {
     schema_version: SCHEMA_VERSION,
     thread_id: key,
@@ -532,9 +591,11 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
     metadata: mergeRuntimeMetadata(prior?.metadata, parsed.metadata),
     ponytail: parsed.ponytail,
     ...(identity.runtime === 'claude' ? { accounting_basis:CLAUDE_ACCOUNTING_BASIS } : {}),
+    ...(identity.runtime === 'claude' && checkpoint ? { checkpoint } : {}),
     compaction_count: parsed.compactions,
     updated_at: timestamp(),
   };
+  if (source.rebaseline) return {valid:false,ambiguous:true,reason:'checkpoint-rebaseline',current,metadata:parsed.metadata};
   if (identity.runtime === 'claude' && prior && prior.accounting_basis !== CLAUDE_ACCOUNTING_BASIS) {
     return {valid:false,ambiguous:true,reason:'identity-rebaseline',current,metadata:parsed.metadata};
   }
@@ -1564,7 +1625,8 @@ function stopFailureCategory(input) {
 }
 
 function responseForStopFailure(state, input, runtime = 'codex', efficiency = null) {
-  const snapshot = readSnapshots(input.transcript_path, runtime);
+  const mainKey = threadIdentity('main', sourceIdentity(runtime, input.session_id, 'main', sessionGeneration(state, input, runtime)));
+  const snapshot = readSnapshots(input.transcript_path, runtime, state.threads[mainKey]?.checkpoint);
   const turnHash = stopTurnIdentity(state, input, snapshot, runtime);
   const turn = ensureTurn(state, turnHash);
   if (turn.receipt) {
@@ -1646,7 +1708,10 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   // Complete host counters with an explicit turn/session binding need no
   // transcript reread. Ambiguous/partial deliveries retain the old fallback.
   const preferredStructured=structuredUsage?.quality==='exact'&&safeOpaqueHostIdentifier(input.session_id)&&safeOpaqueHostIdentifier(input.turn_id)?structuredUsage:null;
-  const snapshot = preferredStructured?{unreadable:true,truncated:false,parsed:parseTokenSnapshots('')}:readSnapshots(input.transcript_path, runtime);
+  const generation = sessionGeneration(state, input, runtime);
+  const mainSourceId = sourceIdentity(runtime, input.session_id, 'main', generation);
+  const mainKey = threadIdentity('main', mainSourceId);
+  const snapshot = preferredStructured?{unreadable:true,truncated:false,parsed:parseTokenSnapshots('')}:readSnapshots(input.transcript_path, runtime, state.threads[mainKey]?.checkpoint);
   const turnHash = stopTurnIdentity(state, input, snapshot, runtime);
   const turn = ensureTurn(state, turnHash);
   if (turn.receipt) {
@@ -1680,9 +1745,6 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
     : stagedSnapshot ?? snapshot;
   attachScopeChildren(state, input, turn, runtime);
 
-  const generation = sessionGeneration(state, input, runtime);
-  const mainSourceId = sourceIdentity(runtime, input.session_id, 'main', generation);
-  const mainKey = threadIdentity('main', mainSourceId);
   const main = preferredStructured?{valid:false,ambiguous:false,metadata:hookMetadata(input,'main')}:mainKey && mainSourceId
     ? updateThread(state, mainKey, input.transcript_path, mainSourceId, mainSnapshot, { runtime, session_id: input.session_id, turn_id:input.turn_id })
     : { valid: false, ambiguous: true, reason: 'source-mismatch' };
@@ -1762,7 +1824,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
     workflow_context: workflowContextForReceipt({ metadata: turn.main?.metadata }, state.usage?.config?.workflow_advisor),
     ...(usageLayers ? { usage_layers: usageLayers } : {}),
     usage_coverage: coverage,
-    telemetry_reconciliation: main.reason === 'identity-rebaseline'
+    telemetry_reconciliation: main.reason === 'identity-rebaseline' || main.reason === 'checkpoint-rebaseline'
       ? { state: 'unavailable', source: 'none', attempts: 1, outcome: 'identity_rebaseline' }
       : telemetryReconciliation(
         structuredMain ? 'structured_hook' : main.valid ? 'transcript' : 'none',
@@ -2020,12 +2082,16 @@ function processSubagentStart(state, input, runtime = 'codex', env = {}) {
 function processSessionStart(state, input, runtime = 'codex') {
   const transcriptPath = input.transcript_path;
   if (typeof transcriptPath !== 'string' || transcriptPath.length === 0) return {};
-  const source = readSnapshots(transcriptPath, runtime);
-  if (source.unreadable || !source.parsed.latest) return {};
   const generation = sessionGeneration(state, input, runtime);
   const mainSourceId = sourceIdentity(runtime, input.session_id, 'main', generation);
   const key = threadIdentity('main', mainSourceId);
   if (!key || !mainSourceId) return {};
+  // Claude Code compacts mid-turn and then fires SessionStart "compact". The
+  // transcript keeps the turn's earlier responses, so a thread with a baseline
+  // keeps it until Stop; committing here dropped them from the turn receipt.
+  if (runtime === 'claude' && input.source === 'compact' && state.threads[key]) return {};
+  const source = readSnapshots(transcriptPath, runtime, state.threads[key]?.checkpoint);
+  if (source.unreadable || !source.parsed.latest) return {};
   const result = updateThread(state, key, transcriptPath, mainSourceId, source, { runtime, session_id: input.session_id });
   if (result.valid || result.current) {
     state.threads[key].metadata = mergeRuntimeMetadata(state.threads[key]?.metadata, hookMetadata(input, 'main'), source.parsed.metadata);
@@ -2059,17 +2125,17 @@ function reconcilePendingClaudeTranscript(state, input, env = {}) {
   const receipt = pending[0];
   // A reset has already replaced the baseline; it cannot prove this turn's
   // usage on a second read. Only authoritative structured usage may repair it.
-  if (['counter-reset','identity-rebaseline'].includes(receipt.reason)) return pendingClaudeReconciliationResult('transcript_ambiguous');
+  if (['counter-reset','identity-rebaseline','checkpoint-rebaseline'].includes(receipt.reason)) return pendingClaudeReconciliationResult('transcript_ambiguous');
   const turn = state.turns?.[receipt.turn_id];
   const mainSourceId = sourceIdentity('claude', input.session_id, 'main', generation);
   if (!turn || !mainSourceId || turn.main?.source_id !== mainSourceId) {
     return pendingClaudeReconciliationResult('transcript_ambiguous');
   }
 
-  const source = readSnapshots(input.transcript_path, 'claude');
+  const key = threadIdentity('main', mainSourceId);
+  const source = readSnapshots(input.transcript_path, 'claude', state.threads[key]?.checkpoint);
   if (source.unreadable) return pendingClaudeReconciliationResult('transcript_unavailable');
   if (!source.parsed.latest) return pendingClaudeReconciliationResult('token_snapshot_missing');
-  const key = threadIdentity('main', mainSourceId);
   const prior = state.threads[key]?.usage;
   const sessionRecord = state.advisor?.sessions?.[sessionKey(input.session_id, 'claude')];
   const promptCount = sessionRecord?.event_counts?.UserPromptSubmit ?? 0;

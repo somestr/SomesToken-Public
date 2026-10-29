@@ -88,11 +88,11 @@ function recordsDigest(records) {
 // A checkpoint's prefix check is CRC32 where Node has it (owner decision
 // 2026-10-27): it catches accidental rewrites, not a hostile same-user writer,
 // who could append usage lines anyway.
-function prefixCheck(value=0) {
+export function prefixCheck(value=0) {
   if(typeof zlib.crc32!=='function')return crypto.createHash('sha256');
   return {update(bytes){value=zlib.crc32(bytes,value);return this;},copy:()=>prefixCheck(value),digest:()=>value.toString(16).padStart(8,'0')};
 }
-function prefixDigest(fd,size) {
+export function prefixDigest(fd,size) {
   const digest=prefixCheck(),buffer=Buffer.allocUnsafe(64*1024);
   for(let offset=0;offset<size;){
     const n=fs.readSync(fd,buffer,0,Math.min(buffer.length,size-offset),offset);

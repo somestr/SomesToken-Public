@@ -68,7 +68,7 @@ export const MAX_EFFICIENCY_WARNINGS = 100;
 
 export const RECOVERED_STATE = Symbol('somestoken-state-recovered');
 
-const SAFE_REASONS = new Set(['transcript-unavailable', 'unsupported-transcript', 'counter-reset', 'bounded-tail-without-baseline', 'identity-rebaseline', 'inconsistent-total', 'source-mismatch', 'stop_failure']);
+const SAFE_REASONS = new Set(['transcript-unavailable', 'unsupported-transcript', 'counter-reset', 'bounded-tail-without-baseline', 'identity-rebaseline', 'checkpoint-rebaseline', 'inconsistent-total', 'source-mismatch', 'stop_failure']);
 
 const TELEMETRY_STATES = new Set(['received', 'pending_post_turn', 'unavailable']);
 
@@ -558,6 +558,21 @@ function persistedMetadataFields(value) {
   };
 }
 
+// A Claude receipt checkpoint holds numbers and hashes only; anything else is dropped,
+// and the next read over 64 MiB then rebases once.
+function persistedClaudeCheckpoint(value, runtime) {
+  if (!value || typeof value !== 'object' || value.basis !== CLAUDE_ACCOUNTING_BASIS || typeof value.absolute !== 'boolean') return null;
+  const count = (n) => Number.isSafeInteger(n) && n >= 0, identity = (n) => Number.isFinite(n) && n >= 0;
+  const usage = persistedUsage(value.usage, runtime);
+  const boundary = Array.isArray(value.boundary) && value.boundary.length <= 4 ? value.boundary.map((entry) =>
+    typeof entry?.response === 'string' && /^[a-f0-9]{20}$/.test(entry.response) && persistedUsage(entry.usage, runtime)
+      ? { response:entry.response, usage:persistedUsage(entry.usage, runtime) } : null) : [null];
+  if (!usage || boundary.includes(null) || !count(value.size) || !identity(value.dev) || !identity(value.ino)
+    || !/^[a-f0-9]{8}$/.test(value.crc32) || !count(value.usage_lines) || !count(value.compactions)) return null;
+  return { basis:value.basis, size:value.size, dev:value.dev, ino:value.ino, crc32:value.crc32, absolute:value.absolute,
+    usage, usage_lines:value.usage_lines, compactions:value.compactions, ponytail:persistedPonytail(value.ponytail), boundary };
+}
+
 export function persistedPonytail(value) {
   if (!value || typeof value !== 'object') return { status: 'unknown', reason: PONYTAIL_UNKNOWN_REASON, coverage_count: 0 };
   const legacyStatus = value.status === 'not-detected' || value.status === 'explicit-command-requested'
@@ -648,6 +663,7 @@ export function recoverState(value, options = {}) {
     if (!usage) continue;
     if (!/^(?:main|subagent):[a-f0-9]{20}$/.test(key)) continue;
     const sourceId = key.slice(key.indexOf(':') + 1);
+    const checkpoint = persistedClaudeCheckpoint(entry.checkpoint, runtime);
     state.threads[key] = {
       schema_version: SCHEMA_VERSION,
       thread_id: key,
@@ -656,6 +672,7 @@ export function recoverState(value, options = {}) {
       metadata: persistedMetadata(entry.metadata),
       ponytail: persistedPonytail(entry.ponytail),
       ...(['claude_full_v1',CLAUDE_ACCOUNTING_BASIS,'structured_hook_v1'].includes(entry.accounting_basis) ? { accounting_basis:entry.accounting_basis } : {}),
+      ...(checkpoint ? { checkpoint } : {}),
       compaction_count: Number.isSafeInteger(entry.compaction_count) && entry.compaction_count >= 0 ? entry.compaction_count : 0,
       updated_at: persistedTime(entry.updated_at),
     };

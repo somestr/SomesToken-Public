@@ -498,12 +498,21 @@ export function parseCodexLedger(text) {
   return reader.finish();
 }
 
-/** Parse only numeric token snapshots. Event content is intentionally discarded. */
-export function parseTokenSnapshots(text) {
+// A Claude response in a receipt checkpoint is keyed by a hash, never its raw id.
+const claudeResponseKey = (id) => hashId(`claude:response:${id}`);
+const CLAUDE_TAIL_RESPONSES = 4;
+
+/**
+ * Parse only numeric token snapshots. Event content is intentionally discarded.
+ * `claudeSeed` is a checkpoint's last responses ({response, usage}): a parse of
+ * only the bytes appended after it then counts a response that began before
+ * them once.
+ */
+export function parseTokenSnapshots(text, { claudeSeed } = {}) {
   const snapshots = [];
   const claudeSnapshots = [];
   const codexSnapshots = [];
-  const claudeResponses = new Map();
+  const claudeResponses = new Map(claudeSeed?.map(({ response, usage }) => [response, usage]));
   let malformed = 0;
   let unknown = 0;
   let compactions = 0;
@@ -538,7 +547,8 @@ export function parseTokenSnapshots(text) {
       // message id, else line uuid. The last copy counts; differing copies make the
       // total inconsistent instead of adding up.
       if (event.isApiErrorMessage !== true && event.isSynthetic !== true && event.message?.model !== '<synthetic>') {
-        const id = event.message?.id ?? event.uuid, key = typeof id === 'string' && id ? id : snapshot;
+        const id = event.message?.id ?? event.uuid;
+        const key = typeof id === 'string' && id ? (claudeSeed ? claudeResponseKey(id) : id) : snapshot;
         const previous = claudeResponses.get(key);
         claudeResponses.set(key, previous && JSON.stringify(previous) !== JSON.stringify(claudeUsage) ? { ...claudeUsage, consistent: false } : claudeUsage);
       }
@@ -576,6 +586,8 @@ export function parseTokenSnapshots(text) {
     malformed,
     unknown,
     compactions,
+    claude_tail: [...claudeResponses].filter(([key]) => typeof key === 'string').slice(-CLAUDE_TAIL_RESPONSES)
+      .map(([key, usage]) => ({ response: claudeSeed ? key : claudeResponseKey(key), usage })),
   };
 }
 

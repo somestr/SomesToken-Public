@@ -129,7 +129,7 @@ SomesToken does not copy host conversation logs. It keeps derived numbers in hos
 
 - The workspace store is capped at 64 MiB. Responses are kept for up to 90 days, at most 100,000 of them, and a byte budget can evict older responses sooner. When a limit applies, the oldest responses go first and reports name the `response_retention_bound` gap.
 - Claude's numeric feed has its own 64 MiB budget.
-- A Claude turn receipt is computed from the whole session transcript, which must be at most 64 MiB. In a longer session, turn receipts are `unavailable`; with the Claude opt-in, the collector still records that session's usage in daily totals and tasks.
+- A Claude turn receipt reads the whole session transcript up to 64 MiB. Past 32 MiB, each turn also stores a small checkpoint: the transcript's identity, a CRC32 of the part already read and the running totals. A longer transcript is read from that checkpoint, parsing at most 64 MiB of new data. One turn is `unavailable` while the counter is rebased when a session over 64 MiB has no checkpoint yet (for example right after you update), when its transcript was rewritten, or when it grew by more than 64 MiB in one turn. With the Claude opt-in, the collector still records that session's usage in daily totals and tasks.
 - The collector trims only its own logs and its own abandoned temporary files. Host transcripts, Codex databases and other projects are never cleanup targets.
 
 ## Update
