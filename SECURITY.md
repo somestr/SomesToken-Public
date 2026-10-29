@@ -24,6 +24,6 @@ No response or remediation time is promised. Release and disclosure timing remai
 
 ## Security boundary
 
-SomesToken is local, read-only development tooling. Ordinary hooks and reports make no network requests and no model calls. The background collector asks the locally installed Codex app-server for account quota; Codex may contact its provider to answer.
+SomesToken is local development tooling. Its reports are read-only; the one part that edits files is the `somestoken-code` skill, and only for code changes you ask for. Ordinary hooks and reports make no network requests and no model calls. The background collector asks the locally installed Codex app-server for account quota; Codex may contact its provider to answer.
 
 Stored receipts and reports allow only bounded counters, timestamps, model metadata, fixed reason codes and hashed identities. Prompts, responses, reasoning, source code, diffs, tool content, commands, secrets, raw transcripts, working directories, absolute paths and account identifiers are excluded. The private source registry may keep the local paths of authorized sources so the collector can refresh them; it stays local and never appears in reports or packages.

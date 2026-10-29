@@ -87,7 +87,7 @@ This creates and loads the launchd job `com.somestr.somestoken.monitor` (`~/Libr
 
 Keep the SomesToken folder where it is, on your startup disk and outside Desktop, Documents and Downloads: the job runs the collector from it, and macOS can deny background jobs access to external drives and those folders. If you use Codex, the collector also reads account quota from the local Codex app-server.
 
-If you later revoke every opt-in, also unload the job with `launchctl bootout "gui/$(id -u)/com.somestr.somestoken.monitor"`; otherwise it stops at the start of each run and its error log keeps growing.
+If you later revoke every opt-in, each run of the job exits at once (exit code 1) and writes nothing. Unload it with `launchctl bootout "gui/$(id -u)/com.somestr.somestoken.monitor"` so it stops starting.
 
 Without launchd, or on another platform, run the collector yourself: `node plugins/somestoken/bin/monitor.mjs --once` refreshes on demand, and `--watch` keeps it running in an open terminal.
 
@@ -96,11 +96,11 @@ Without launchd, or on another platform, run the collector yourself: `node plugi
 Complete one normal task in the host, then run:
 
 ```sh
+node plugins/somestoken/bin/console.mjs --view=daily
 node plugins/somestoken/bin/report.mjs --diagnostics --json
-node plugins/somestoken/bin/report.mjs --summary
 ```
 
-Diagnostics separates the loaded reporter version, data source, snapshot age, receipt age, quality and the next action. `unavailable` can be a valid state, for example before the first collector run; it never stands for zero usage.
+`daily` lists the collector's responses per day and host. Diagnostics separates the loaded reporter version, data source, snapshot age, receipt age, quality and the next action; its `collection` block describes the collector. A terminal does not receive the host's plugin data, so there the top-level receipt fields read `unavailable` with the reason `host_plugin_data_unavailable`, and `report.mjs --summary` has no receipts to show. Turn receipts are reported inside the host (see [Reports](#reports)). `unavailable` can be a valid state, for example before the first collector run; it never stands for zero usage.
 
 ## Reports
 
@@ -129,6 +129,7 @@ SomesToken does not copy host conversation logs. It keeps derived numbers in hos
 
 - The workspace store is capped at 64 MiB. Responses are kept for up to 90 days, at most 100,000 of them, and a byte budget can evict older responses sooner. When a limit applies, the oldest responses go first and reports name the `response_retention_bound` gap.
 - Claude's numeric feed has its own 64 MiB budget.
+- A Claude turn receipt is computed from the whole session transcript, which must be at most 64 MiB. In a longer session, turn receipts are `unavailable`; with the Claude opt-in, the collector still records that session's usage in daily totals and tasks.
 - The collector trims only its own logs and its own abandoned temporary files. Host transcripts, Codex databases and other projects are never cleanup targets.
 
 ## Update

@@ -22,7 +22,13 @@ const value=name=>args.find(a=>a.startsWith('--'+name+'='))?.slice(name.length+3
 const root=configuredCodexLedgerRoot(process.env);
 const interval=Number(value('interval')??30),timeZone=value('timezone')??Intl.DateTimeFormat().resolvedOptions().timeZone;
 if(args.includes('--help')) {console.log('SomesToken monitor --once | --watch | --scheduled [--interval=30] [--timezone=Europe/Dublin] [--no-quota]\nInterval is in seconds (15..3600). Profile options record metadata only; they do not run models or change host settings.\nTask identity: --task-id=<host-session-id> can replace --task=<key>.\nProject work defaults: --project=<absolute-path> --host=<host> and the five work controls (no model/effort/tier); applied on the next natural start.\n--scheduled: check for changed sources, collect if needed and exit; suitable for an OS scheduler.\nTask profile: --task=<key> --host=codex|claude --model=<id> --effort=<effort> --workload=inspect|fix|refactor|migration|test --service-tier=default|standard|fast|priority|flex|batch|ultrafast --context-band=small|medium|large --scope-band=narrow|medium|broad --verification-band=light|standard|extensive --planned-subagent-policy=none|bounded|parallel');process.exit(0);}
-if(!directory || (!root && !configuredClaudeWorkspaceRoot(process.env)))throw new Error('Enable a Codex ledger or Claude workspace feed first. Next: use --help for supported options.');
+if(!directory || (!root && !configuredClaudeWorkspaceRoot(process.env))){
+  // Setup installs the job only after an opt-in, so a scheduled run gets here once
+  // every opt-in was revoked. It exits at once and writes nothing; a message here
+  // would grow the launchd log by one entry every interval.
+  if(args.includes('--scheduled'))process.exit(1);
+  throw new Error('Enable a Codex ledger or Claude workspace feed first. Next: use --help for supported options.');
+}
 if(args.some(a=>!/^--(?:once|watch|scheduled|no-quota|interval=\d+|timezone=.+|task=[a-f0-9]{20}|task-id=[A-Za-z0-9][A-Za-z0-9._:-]{0,159}|project=.+|host=(?:codex|claude)|model=[A-Za-z0-9._+-]{1,80}|effort=[a-z]{1,80}|workload=(?:inspect|fix|refactor|migration|test)|service-tier=(?:default|standard|fast|priority|flex|batch|ultrafast)|context-band=(?:small|medium|large)|scope-band=(?:narrow|medium|broad)|verification-band=(?:light|standard|extensive)|planned-subagent-policy=(?:none|bounded|parallel))$/.test(a)))throw new Error('Invalid monitor arguments · Next: use --help for supported options.');
 const optionNames=args.map(arg=>arg.slice(2).split('=',1)[0]);
 if(new Set(optionNames).size!==optionNames.length||['once','watch','scheduled'].filter(name=>optionNames.includes(name)).length>1)throw new Error('Invalid monitor arguments · Next: use --help for supported options.');
