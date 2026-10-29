@@ -141,6 +141,22 @@ export function statusLineFeasibility(env = {}) {
   };
 }
 
+const CACHE_TTL_MS={'5m':300000,'1h':3600000};
+/** Claude Code's own prompt-cache state for the main conversation (status-line
+ * `prompt_cache`, Claude Code 2.1.251+). Display only; never stored. The flag can
+ * be one refresh old, so a warm claim needs an expiry that is still ahead of now
+ * and within the reported TTL. Absent or malformed input makes no claim. */
+export function claudeCacheSegment(input,{now=Date.now()}={}) {
+  const c=input?.prompt_cache;
+  if(typeof c?.warm!=='boolean')return null;
+  if(c.caching_observed===false)return 'cache not observed';
+  if(!c.warm)return 'cache cold';
+  const left=c.expires_at*1000-now;
+  if(!Number.isSafeInteger(c.expires_at)||!(left<=CACHE_TTL_MS[c.ttl]))return null;
+  if(left<=0)return 'cache cold';
+  return `cache warm (${left<60000?'<1':Math.floor(left/60000)}m left)`;
+}
+
 export function fitStatusLine(parts,{columns=256}={}) {
   const width=Number(columns),limit=Number.isSafeInteger(width)&&width>0?Math.min(width,256):256;
   const segments=[...parts],full=segments.join(' · ');if(full.length<=limit)return full;
