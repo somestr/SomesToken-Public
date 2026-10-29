@@ -503,6 +503,23 @@ function minuteDay(timeZone) {
   let cachedMinute=null,cachedDay=null;
   return timestamp=>{const minute=Math.floor(timestamp/60000);if(minute!==cachedMinute){cachedDay=day(timestamp,timeZone);cachedMinute=minute;}return cachedDay;};
 }
+// Claude Code copies a session's history into the transcript of a session it
+// sends to the background, under that session's id. A copy keeps the response
+// time and usage, and the turn too (the copied prompt keeps its uuid) unless a
+// compaction summary opens that transcript and gives the copies its own turn.
+// No two responses of different sources share turn and time, or time, model and
+// usage, otherwise. Called on rows in merged order, it is true for a copy whose
+// response an earlier row of another source already holds.
+function claudeCopies() {
+  const byTurn=new Map(),byUsage=new Map();
+  return r=>{
+    if(r.host!=='claude')return false;
+    const keys=[[byTurn,r.turn_key+':'+r.observed_at],[byUsage,r.observed_at+':'+r.model+':'+USAGE_KEYS.map(k=>r.usage[k]).join(',')]];
+    if(keys.some(([seen,key])=>seen.has(key)&&seen.get(key)!==r.source_key))return true;
+    for(const [seen,key] of keys)if(!seen.has(key))seen.set(key,r.source_key);
+    return false;
+  };
+}
 // Prior day rows the fresh groups do not fully cover keep their saved totals,
 // corrected by retired legacy rows and by rows this capture re-observed.
 // `rowsForDays(keys)` returns the capture's rows for just those day groups.
@@ -523,7 +540,8 @@ function correctPriorDays(freshDays,{previous,timeZone,retainedDay,priorGroups,r
   for(const [key,old] of pending){
     const retired=retiredGroups.get(key)??[];
     const usage={...old.usage};let added=0;const seen=new Set();let last=old.last_observed_at??previous?.observed_at??0;
-    const replacedTurns=new Set(retired.map(r=>r.source_key+':'+r.turn_key));
+    // Replaced legacy turns take their older precise rows; a retired Claude copy replaces nothing.
+    const replacedTurns=new Set(retired.filter(r=>r.host!=='claude').map(r=>r.source_key+':'+r.turn_key));
     for(const r of retired)for(const k of USAGE_KEYS)usage[k]=usage[k]==null||r.usage[k]==null?null:usage[k]-r.usage[k];
     for(const r of newByDay.get(key)??[]){
       if(seen.has(r.record_key))continue;seen.add(r.record_key);
@@ -705,7 +723,8 @@ export function updateWorkspace(previous,scan,{now=Date.now(),timeZone='UTC',quo
   const observedKeys=new Set();for(const r of incomingRecords)if(validRecord(r))observedKeys.add(r.record_key);
   for(const [key,r] of records)if((r.host==='claude'?typeof scan.host_inventory_complete?.claude==='boolean':typeof scan.record_inventory_complete==='boolean')&&!observedKeys.has(key))records.set(key,{...r,quality:'partial',validation_status:'historical_unverified'});
   observedKeys.clear();
-  const ordered=[...records.values()].sort((a,b)=>a.observed_at-b.observed_at);
+  const isCopy=claudeCopies(),ordered=[],copies=[];
+  for(const r of [...records.values()].sort((a,b)=>a.observed_at-b.observed_at))(isCopy(r)?copies:ordered).push(r);
   records.clear();
   const retained=ordered.slice(retainedFrom(ordered.length,index=>Buffer.byteLength(JSON.stringify(compactRecord(ordered[index]))),responseLimits)),gaps=[...(scan.coverage_gaps??[])];
   if(ordered.length>retained.length)gaps.push('response_retention_bound');
@@ -739,9 +758,11 @@ export function updateWorkspace(previous,scan,{now=Date.now(),timeZone='UTC',quo
   const recordDayKey=r=>recordDayKeyOf(r,localDay);
   const priorByKey=new Map();for(const r of priorRecords)if(validRecord(r))priorByKey.set(r.record_key,r);
   const priorGroups=new Map(),retiredGroups=new Map();for(const r of priorByKey.values()){const key=recordDayKey(r);priorGroups.set(key,(priorGroups.get(key)??0)+1);if(retiredLegacy(r)){const retired=retiredGroups.get(key)??[];retired.push(r);retiredGroups.set(key,retired);}}
+  // A copy the prior snapshot held is in its saved day total; one that just arrived is not.
+  const copyKeys=new Set();for(const c of copies){copyKeys.add(c.record_key);const r=priorByKey.get(c.record_key);if(r){const key=recordDayKey(r),retired=retiredGroups.get(key)??[];retired.push(r);retiredGroups.set(key,retired);}}
   freshDays=correctPriorDays(freshDays,{previous,timeZone,retainedDay,priorGroups,retiredGroups,priorByKey,scan,globalGaps,taskMetadata,
     unverifiedTasks:new Set(ordered.filter(r=>r.validation_status==='historical_unverified').map(r=>r.task_key)),
-    rowsForDays:keys=>{const newByDay=new Map();for(const r of incomingRecords){if(!validRecord(r))continue;const key=recordDayKey(r);if(!keys.has(key))continue;const g=newByDay.get(key)??[];g.push(r);newByDay.set(key,g);}return newByDay;}});
+    rowsForDays:keys=>{const newByDay=new Map();for(const r of incomingRecords){if(!validRecord(r)||copyKeys.has(r.record_key))continue;const key=recordDayKey(r);if(!keys.has(key))continue;const g=newByDay.get(key)??[];g.push(r);newByDay.set(key,g);}return newByDay;}});
   const todayCutoff=localDay(cutoff);
   const oldDays=(previous?.time_zone===timeZone&&Array.isArray(previous?.daily)?previous.daily:[]).filter(d=>typeof d.date==='string'&&d.date<todayCutoff&&d.date>=localDay(now-365*DAY));
   const sourceIndex=retainedSourceIndex(scan,previous);sourceIndex.keep(retained);
@@ -886,7 +907,14 @@ function writeWorkspaceStreamingOnce(directory,{previous,priorFacts,priorPass,sc
     spoolFd=fs.openSync(spoolName,'wx',0o600);spoolOwned=fs.fstatSync(spoolFd);
     const spool=spoolWriter(spoolFd);
     const taskRows=new Map(),quotaRows=[],sizes=[];let emitted=0,canonical=true;
+    // Rows arrive in merged order, as updateWorkspace sorts them; a prior copy leaves its saved day total.
+    const isCopy=claudeCopies(),copyKeys=new Set();
     const emit=(row,before,stored)=>{
+      if(isCopy(row)){
+        copyKeys.add(row.record_key);
+        if(before&&validRecord(before)){const key=recordDayKey(before),list=retiredGroups.get(key)??[];list.push(before);retiredGroups.set(key,list);}
+        return;
+      }
       const text=(stored??JSON.stringify(compactRecord(row)))+'\n',offset=spool.position;
       spool.write(text);
       let list=taskRows.get(row.task_key);if(!list)taskRows.set(row.task_key,list=[]);
@@ -1008,7 +1036,7 @@ function writeWorkspaceStreamingOnce(directory,{previous,priorFacts,priorPass,sc
     let freshDays=correctPriorDays(dayGroups.sort((a,b)=>a.first-b.first).map(group=>group.day),{previous,timeZone,retainedDay,priorGroups,retiredGroups,
       priorByKey:{get:key=>priorLookup.get(key)},scan,globalGaps,taskMetadata,unverifiedTasks,
       rowsForDays:keys=>{
-        const newByDay=new Map(),add=(row,prior)=>{const key=recordDayKey(row);if(!keys.has(key))return;const group=newByDay.get(key)??[];group.push(row);newByDay.set(key,group);if(prior)priorLookup.set(row.record_key,prior);};
+        const newByDay=new Map(),add=(row,prior)=>{const key=recordDayKey(row);if(!keys.has(key)||copyKeys.has(row.record_key))return;const group=newByDay.get(key)??[];group.push(row);newByDay.set(key,group);if(prior)priorLookup.set(row.record_key,prior);};
         for(const [key,row] of normalizedIncoming){const match=priorMatch.get(key);add(row,match&&validRecord(match.row)?match.row:undefined);}
         if([...keys].every(key=>shortDays.has(key)))for(const [row,prior] of shortRows)add(row,prior);
         else if((reusedSources.size||confirmations.size)&&!readPrior(text=>{const r=expandRecord(JSON.parse(text)),confirmed=confirmedRow(r);

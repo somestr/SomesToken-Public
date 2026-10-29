@@ -186,6 +186,8 @@ function refreshLocked({home=os.homedir(),codexHome=path.join(home,'.codex'),sou
       if(!destinationStat)continue;
       if(!destinationStat.isDirectory())throw Error('destination_type_conflict');
       const old=files(claude); // Includes every destination file, including obsolete runtime files.
+      // Claude ages out an orphaned version by removing its files and can keep only the marker; nothing there loads.
+      if(destinationVersion!==version&&!old.length&&stat(path.join(claude,'.orphaned_at'))?.isFile())continue;
       const oldManifestEntry=old.find(entry=>entry.name==='.claude-plugin/plugin.json');
       let oldManifest;
       try{oldManifest=JSON.parse(oldManifestEntry?.data);}catch{throw Error(destinationVersion===version?'claude_install_manifest_invalid':'claude_compat_manifest_invalid');}
