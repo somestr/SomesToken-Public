@@ -1416,7 +1416,15 @@ function attachScopeChildren(state, input, turn, runtime = 'codex') {
     && link.open === true
   ));
   if (!targetScopeId) {
-    turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, (turn.overflow_count ?? 0) + sessionAgents.length);
+    // Without a turn id (Claude) a link has no scope. A child that stopped
+    // since the last main Stop counts for this turn only, then its link goes.
+    const stoppedAgents = Object.entries(state.agent_scopes).filter(([, link]) => (
+      link.session === sessionHash
+      && (Number.isSafeInteger(link.session_generation) ? link.session_generation : 0) === generation
+      && link.status === 'stopped'
+    ));
+    turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, (turn.overflow_count ?? 0) + sessionAgents.length + stoppedAgents.length);
+    for (const [agentHash] of stoppedAgents) delete state.agent_scopes[agentHash];
     return;
   }
   const openAgents = sessionAgents.filter(([, link]) => link.source_scope === targetScopeId);
@@ -1902,8 +1910,9 @@ function processSubagentStart(state, input, runtime = 'codex', env = {}) {
       updated_at: timestamp(),
     };
     const session = sessionIdentity(runtime, input.session_id);
-    if (session) {
-      state.agent_scopes[agentHash] ??= {
+    // A resumed child starts again, so a stopped link becomes pending.
+    if (session && (!state.agent_scopes[agentHash] || state.agent_scopes[agentHash].status === 'stopped')) {
+      state.agent_scopes[agentHash] = {
         agent_id: agentHash,
         session,
         child_turn: childTurnHash,
@@ -2375,6 +2384,12 @@ function processSubagentStop(state, input, runtime = 'codex', env = {}) {
     turn.subagents[agentHash] = entry;
     turn.updated_at = timestamp();
     if (targetScope) targetScope.updated_at = timestamp();
+    // A link without a scope (no turn id, as with Claude) can never resolve
+    // here; record that its child stopped so it stops keeping later turns
+    // partial (see attachScopeChildren).
+    if (link?.status === 'pending' && !link.source_scope && sessionMatches && childIdentityMatches) {
+      state.agent_scopes[agentHash] = { ...link, status: 'stopped', updated_at: timestamp() };
+    }
     return {};
   }
   entry.status = result.valid ? 'completed' : 'unavailable';

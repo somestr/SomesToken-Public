@@ -855,7 +855,7 @@ export function recoverState(value, options = {}) {
       ...(typeof entry.lifecycle_turn_id === 'string' && /^[a-f0-9]{20}$/.test(entry.lifecycle_turn_id) ? { lifecycle_turn_id: entry.lifecycle_turn_id } : {}),
       generation: Number.isSafeInteger(entry.generation) && entry.generation >= 0 ? entry.generation : 0,
       session_generation: persistedGeneration(entry.session_generation),
-      status: entry.status === 'completed' ? 'completed' : entry.status === 'pending' ? 'pending' : 'unavailable',
+      status: ['completed', 'pending', 'stopped'].includes(entry.status) ? entry.status : 'unavailable',
       open: entry.open === true,
       updated_at: persistedTime(entry.updated_at),
     };
