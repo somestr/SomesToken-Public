@@ -18,7 +18,11 @@ if(process.argv.includes('--capture')) {
   const r=result?.record;
   const quota=r?.quota_windows.map(q=>`${q.window_id==='five_hour'?'5h':'7d'} ${q.used_percent.toLocaleString('en-US',{maximumFractionDigits:2,useGrouping:false})}% used`)??[];
   const model=r?.configured_model==='unknown'?'model unavailable':r?.configured_model,effort=r?.configured_effort==='unknown'?'effort unavailable':r?.configured_effort;
-  process.stdout.write(fitStatusLine(r?['SomesToken',...quota,`${model}/${effort}`,...(cache?[cache]:[])]:['SomesToken','host usage unavailable','next: check diagnostics'],width)+'\n');
+  const parts=r?['SomesToken',...quota,`${model}/${effort}`,...(cache?[cache]:[])]:['SomesToken','host usage unavailable','next: check diagnostics'];
+  let line=fitStatusLine(parts,width);
+  // The re-cache count is optional detail: where it would push the cache state out, show the short cold state.
+  if(r&&cache?.startsWith('cache cold (')&&!line.endsWith(cache))line=fitStatusLine([...parts.slice(0,-1),'cache cold'],width);
+  process.stdout.write(line+'\n');
   process.exit(0);
 }
 

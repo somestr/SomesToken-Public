@@ -145,15 +145,19 @@ const CACHE_TTL_MS={'5m':300000,'1h':3600000};
 /** Claude Code's own prompt-cache state for the main conversation (status-line
  * `prompt_cache`, Claude Code 2.1.251+). Display only; never stored. The flag can
  * be one refresh old, so a warm claim needs an expiry that is still ahead of now
- * and within the reported TTL. Absent or malformed input makes no claim. */
+ * and within the reported TTL. Absent or malformed input makes no claim. A cold
+ * segment adds Claude Code's own `recache_tokens_if_cold` (what the next request
+ * re-caches) only when it is a positive whole number; it is `null` after a compaction. */
 export function claudeCacheSegment(input,{now=Date.now()}={}) {
   const c=input?.prompt_cache;
   if(typeof c?.warm!=='boolean')return null;
   if(c.caching_observed===false)return 'cache not observed';
-  if(!c.warm)return 'cache cold';
+  const recache=c.recache_tokens_if_cold,cold=Number.isSafeInteger(recache)&&recache>0
+    ?`cache cold (next prompt re-caches ${recache.toLocaleString('en-US')} tokens)`:'cache cold';
+  if(!c.warm)return cold;
   const left=c.expires_at*1000-now;
   if(!Number.isSafeInteger(c.expires_at)||!(left<=CACHE_TTL_MS[c.ttl]))return null;
-  if(left<=0)return 'cache cold';
+  if(left<=0)return cold;
   return `cache warm (${left<60000?'<1':Math.floor(left/60000)}m left)`;
 }
 
