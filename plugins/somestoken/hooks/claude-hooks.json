@@ -190,15 +190,6 @@
             "command": "node",
             "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/somestoken.mjs", "--runtime", "claude", "--data-root", "${CLAUDE_PLUGIN_DATA}"],
             "timeout": 10
-          },
-          {
-            "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/cache-keepalive.mjs", "--data-root", "${CLAUDE_PLUGIN_DATA}"],
-            "timeout": 3600,
-            "asyncRewake": true,
-            "rewakeMessage": "SomesToken cache keep-alive:",
-            "rewakeSummary": "SomesToken: keeping the prompt cache warm"
           }
         ]
       }

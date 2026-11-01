@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import { isDeepStrictEqual } from 'node:util';
 
 import { packageArtifactName, readPluginManifest, readPackageFile } from './plugin-manifest.mjs';
 
@@ -106,9 +105,6 @@ export const REQUIRED_ENTRIES = Object.freeze([
   'lib/change/toolchain.mjs',
   'lib/change/workflow.mjs',
   'bin/handoff.mjs',
-  'bin/keepalive.mjs',
-  'hooks/cache-keepalive.mjs',
-  'lib/cache-keepalive.mjs',
   'lib/handoff/hook.mjs',
   'lib/handoff/note.mjs',
   'lib/handoff/quota.mjs',
@@ -179,11 +175,6 @@ const CODEX_HOOK_COMMAND = 'if [ -n "${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-}}" ];
 const CODEX_MCP_ARGS = Object.freeze(['./mcp/server.mjs', '--stdio']);
 const CLAUDE_ASYNC_HOOK_EVENTS = Object.freeze(['PreToolUse', 'PostToolBatch']);
 const CLAUDE_HOOK_ARGS = Object.freeze(['${CLAUDE_PLUGIN_ROOT}/hooks/somestoken.mjs', '--runtime', 'claude', '--data-root', '${CLAUDE_PLUGIN_DATA}']);
-// The opt-in cache keep-alive: the only second hook, on Stop, waking the model through asyncRewake.
-export const CLAUDE_KEEPALIVE_HOOK = Object.freeze({
-  type: 'command', command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/hooks/cache-keepalive.mjs', '--data-root', '${CLAUDE_PLUGIN_DATA}'],
-  timeout: 3600, asyncRewake: true, rewakeMessage: 'SomesToken cache keep-alive:', rewakeSummary: 'SomesToken: keeping the prompt cache warm',
-});
 const CLAUDE_MCP_ARGS = Object.freeze(['${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs', '--stdio']);
 const CLAUDE_MCP_ENV = Object.freeze({
   PLUGIN_DATA: '${CLAUDE_PLUGIN_DATA}',
@@ -527,10 +518,8 @@ export function validateHostHooks(hooks, host) {
   }
   for (const event of expectedEvents) {
     const group = hooks.hooks[event];
-    const keepalive = isClaude && event === 'Stop';
     const entry = Array.isArray(group) && group.length === 1 && Array.isArray(group[0]?.hooks)
-      && group[0].hooks.length === (keepalive ? 2 : 1)
-      && (!keepalive || isDeepStrictEqual(group[0].hooks[1], CLAUDE_KEEPALIVE_HOOK)) ? group[0].hooks[0] : null;
+      && group[0].hooks.length === 1 ? group[0].hooks[0] : null;
     const expectedTimeout = !isClaude && event === 'SessionEnd' ? 3 : 10;
     const commandValid = isClaude
       ? entry?.command === 'node' && JSON.stringify(entry?.args) === JSON.stringify(CLAUDE_HOOK_ARGS)

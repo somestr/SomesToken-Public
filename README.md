@@ -12,7 +12,7 @@ SomesToken measures usage. It does not claim to save tokens, quota or money. Sav
 
 - **Usage by task.** Once you opt in (see [Install](#install)), each task's usage is split by model, reasoning effort, main agent and subagents, cache reads and writes, with account quota windows shown separately. Quota is shared by the whole account, so tasks get token shares, never quota shares.
 - **Honest labels.** Every figure is `exact`, `partial`, `pending` or `unavailable`. Missing data never becomes zero. Prices are calculated from published rates and are not bills.
-- **Local and private.** Hooks and reports make no model calls, send no telemetry and upload nothing, and there is no web dashboard. The one exception is the opt-in Claude cache keep-alive, off by default, described under [Privacy](#privacy). See [Privacy](#privacy) for the two places where more than numbers is kept locally.
+- **Local and private.** Hooks and reports make no model calls, send no telemetry and upload nothing, and there is no web dashboard. See [Privacy](#privacy) for the two places where more than numbers is kept locally.
 - **Read-only reporting.** Reports never change a model, reasoning effort, plan, permission or task. The one part that edits files is the `somestoken-code` skill described below, and only for code changes you ask for.
 - **Bounded.** The workspace store and Claude's numeric feed are capped at 64 MiB each. Hooks do bounded work: a Claude hook parses at most 64 MiB of new transcript and leaves larger catch-up work to the background collector. Past 64 MiB, a Claude turn receipt is read from a checkpoint that an earlier turn stored. When no usable checkpoint exists, for example in a session that was already that large when you updated, one turn is `unavailable` while the counter is rebased; with the Claude opt-in, the collector still records its usage.
 
@@ -33,6 +33,7 @@ These points are covered by a private automated test suite that uses synthetic d
 - **Other platforms.** Only macOS on Apple silicon is validated. Linux and Windows are not verified.
 - **Other hosts.** Only Codex (Desktop and CLI) and Claude Code are supported.
 - **Unlimited history.** At most 100,000 responses or 90 days are kept; the oldest go first.
+- **Usage that never reaches the transcript.** Model calls that a Claude Code mod makes in the background, such as keep-warm pings from the cache-tax mod, are not written to the transcript, so SomesToken does not count them.
 - **Effortless Codex updates.** Codex 0.164 asks you to approve SomesToken's 11 hooks again after every install or update. The Codex desktop app can skip changed hooks without offering a way to approve them ([openai/codex#37362](https://github.com/openai/codex/issues/37362)); approve them in the Codex CLI instead: run `codex`, open `/hooks`, approve and quit.
 
 ## Requirements
@@ -96,7 +97,7 @@ node plugins/somestoken/bin/console.mjs --view=tasks
 
 ## Privacy
 
-Hooks and reports make no model calls, send no telemetry and upload nothing. The one exception is opt-in and off by default: the Claude cache keep-alive (`node plugins/somestoken/bin/keepalive.mjs on`) wakes Claude Code for a one-word turn shortly before the prompt cache expires, and Claude Code sends that turn to Anthropic like any other request on your account. The collector asks the locally installed Codex app-server for account quota, and Codex may contact OpenAI to answer. SomesToken does not call a billing API or scrape a dashboard.
+Hooks and reports make no model calls, send no telemetry and upload nothing. The collector asks the locally installed Codex app-server for account quota, and Codex may contact OpenAI to answer. SomesToken does not call a billing API or scrape a dashboard.
 
 With your opt-in, the collector reads Codex's saved sessions and Claude Code's transcripts (`~/.claude/projects`) to extract usage numbers; it does not copy them. Stored reports keep counters, timestamps, model names, fixed reason codes and hashed identities. They exclude prompts, responses, reasoning, source code, diffs, tool output, secrets, raw transcripts, working directories, absolute paths and account identifiers.
 

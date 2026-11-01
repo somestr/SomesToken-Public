@@ -1,7 +1,6 @@
 import { activePolicyHookContext, activeTaskPolicy } from './optimization/active-policy.mjs';
 import { handoffHookResponse, rememberPluginData } from './handoff/hook.mjs';
 import { recordLifecycleEvent, DEVELOPMENT_CONTEXT } from './optimization/lifecycle-checks.mjs';
-import { KEEPALIVE_MARKER } from './cache-keepalive.mjs';
 import { captureTaskForecastProfile } from './task-profiles.mjs';
 import { workspaceDirectory, readWorkspaceFile } from './workspace-usage.mjs';
 import { configuredCodexLedgerRoot } from './codex-ledger.mjs';
@@ -2649,10 +2648,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
           sessionGeneration(state, input ?? {}, 'claude'),
         );
       }
-      // A cache keep-alive wake arrives as a prompt but starts no task: no forecast, policy, lifecycle or
-      // handoff step, so the woken turn carries nothing but its one-word request.
-      const keepaliveWake = name === 'UserPromptSubmit' && typeof input?.prompt === 'string' && input.prompt.includes(KEEPALIVE_MARKER);
-      if (!efficiency?.missing_session_identity && !efficiency?.late_event && !keepaliveWake) {
+      if (!efficiency?.missing_session_identity && !efficiency?.late_event) {
         if(['SessionStart','UserPromptSubmit'].includes(name)
           &&(runtime==='codex'?configuredCodexLedgerRoot(hookEnv,hookEnv.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(hookEnv)))
           captureTaskForecastProfile(workspaceDirectory(hookEnv),input??{},runtime,name);
