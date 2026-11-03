@@ -29,6 +29,7 @@ export const REQUIRED_ENTRIES = Object.freeze([
   'hooks/somestoken.mjs',
   'lib/core.mjs',
   'lib/runtime.mjs',
+  'lib/runtime/codex-reviews.mjs',
   'lib/runtime/hot-path.mjs',
   'lib/runtime/state-store.mjs',
   'lib/telemetry-outcomes.mjs',

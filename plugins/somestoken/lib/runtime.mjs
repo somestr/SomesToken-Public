@@ -4,6 +4,7 @@ import { recordLifecycleEvent, DEVELOPMENT_CONTEXT } from './optimization/lifecy
 import { captureTaskForecastProfile } from './task-profiles.mjs';
 import { workspaceDirectory, readWorkspaceFile } from './workspace-usage.mjs';
 import { configuredCodexLedgerRoot } from './codex-ledger.mjs';
+import { codexReviewUsage } from './runtime/codex-reviews.mjs';
 import { configuredClaudeWorkspaceRoot } from './claude-workspace.mjs';
 import { prefixCheck, prefixDigest, TRANSCRIPT_CEILING_BYTES } from './claude-capture.mjs';
 import fs from 'node:fs';
@@ -672,7 +673,10 @@ function hostUsageCoverage(runtime, authMode) {
   return 'somestoken_observed';
 }
 
-function buildReceiptUsageLayers({ runtime, status, summed, model, input, env }) {
+// The counted auto-review usage of a turn. Codex does not name the review model, so it stays unpriced.
+const reviewUsage = (turn) => Object.values(turn?.subagents ?? {}).find((entry) => entry?.auto_review)?.usage;
+
+function buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced }) {
   const quality = usageQualityForStatus(status);
   const authMode = runtime === 'claude' ? detectClaudeAuthMode(input, env) : 'codex';
   const coverage = hostUsageCoverage(runtime, authMode);
@@ -681,8 +685,12 @@ function buildReceiptUsageLayers({ runtime, status, summed, model, input, env })
     : { ...tokenFields(summed), quality, coverage };
   let calculated = { quality: 'unavailable', calculation_quality: 'unavailable' };
   if (runtime === 'codex') {
-    const result = calculateCodexCredits(observed, { model, quality });
-    calculated = { ...result, quality: result.calculation_quality ?? 'unavailable' };
+    // Unpriced review tokens leave the credits a lower bound on the rest.
+    const priced = unpriced ? deltaUsage(unpriced, summed) : undefined;
+    const result = priced === undefined ? calculateCodexCredits(observed, { model, quality })
+      : calculateCodexCredits(priced && { ...tokenFields(priced), coverage }, { model, quality: 'partial' });
+    calculated = { ...result, quality: result.calculation_quality ?? 'unavailable',
+      ...(priced ? { unpriced_components: [...(result.unpriced_components ?? []), 'auto_review_tokens'] } : {}) };
   } else if (authMode !== 'subscription' && authMode !== 'unknown') {
     const apiRates = input?.api_rates && typeof input.api_rates === 'object' ? input.api_rates : null;
     if (apiRates) {
@@ -1579,7 +1587,7 @@ function reconcilePendingReceipt(state, turn, receipt, input, runtime, structure
   const ambiguous = main.ambiguous || subagents.some((entry) => entry.ambiguous) || turn.overflow_count > 0 || summed.consistent === false;
   const status = classifyReceipt({ main, subagents, ambiguous });
   const model = safeModel(input.model) ?? turn.main?.metadata?.model;
-  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env });
+  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: reviewUsage(turn) });
   const planComparison = planComparisonForReceipt(state, runtime, status, summed);
   const expectedSources = 1 + Object.keys(turn.subagents).length + (turn.overflow_count ?? 0);
   const resolvedSources = 1 + subagents.filter((entry) => entry.valid).length;
@@ -1752,6 +1760,20 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
     ? snapshot
     : stagedSnapshot ?? snapshot;
   attachScopeChildren(state, input, turn, runtime);
+  // Codex fires no subagent hook for an auto-review. Read before updateThread commits the thread:
+  // a review of this turn changed its rollout after that commit. Structured Stop usage (never seen on
+  // the maintainer's Mac) might already hold the reviews, so that path is left as it was.
+  // Only the collector's own persistent opt-in ($CODEX_HOME or ~/.codex) allows this read, so a
+  // revocation always reaches it; the installation-local copy that other hook paths accept does not.
+  const codexHome = env.CODEX_HOME ?? (env.HOME ? path.join(env.HOME, '.codex') : undefined);
+  const reviewRoot = runtime === 'codex' && !preferredStructured && codexHome ? configuredCodexLedgerRoot({ CODEX_HOME: codexHome }) : null;
+  const reviews = reviewRoot ? codexReviewUsage({ root: reviewRoot, transcriptPath: input.transcript_path,
+    sessionId: input.session_id, turnId: input.turn_id, since: state.threads[mainKey]?.updated_at }) : null;
+  if (reviews?.usage) {
+    const key = hashId(`codex:auto-review:${turnHash}`);
+    turn.subagents[key] ??= { agent_id: key, status: 'completed', usage: tokenFields(reviews.usage), auto_review: true, updated_at: timestamp() };
+  }
+  if (reviews?.unknown) turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, (turn.overflow_count ?? 0) + 1);
 
   const main = preferredStructured?{valid:false,ambiguous:false,metadata:hookMetadata(input,'main')}:mainKey && mainSourceId
     ? updateThread(state, mainKey, input.transcript_path, mainSourceId, mainSnapshot, { runtime, session_id: input.session_id, turn_id:input.turn_id,
@@ -1804,7 +1826,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   const metadataConfidence = aggregateMetadataConfidence(turn);
   const ponytail = aggregatePonytail(turn);
   const model = safeModel(input.model) ?? turn.main?.metadata?.model;
-  const builtUsage = status === 'unavailable' ? { usageLayers: null, coverage: 'unavailable', authMode: runtime === 'claude' ? detectClaudeAuthMode(input, env) : 'codex' } : buildReceiptUsageLayers({ runtime, status, summed, model, input, env });
+  const builtUsage = status === 'unavailable' ? { usageLayers: null, coverage: 'unavailable', authMode: runtime === 'claude' ? detectClaudeAuthMode(input, env) : 'codex' } : buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: reviewUsage(turn) });
   const { usageLayers, coverage, authMode } = builtUsage;
   const planComparison = planComparisonForReceipt(state, runtime, status, summed);
   const receiptTokenFields = status === 'unavailable' ? {} : tokenFields(summed);
@@ -2232,7 +2254,7 @@ function refreshClosedParentReceipt(state, parentTurn, receipt, input, runtime, 
   const resolvedSources = 1 + subagents.filter((child) => child.valid).length;
   const unavailableSources = Math.max(0, expectedSources - resolvedSources);
   const model = receipt.metadata?.model ?? parentTurn.main.metadata?.model;
-  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env });
+  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: reviewUsage(parentTurn) });
   const planComparison = planComparisonForReceipt(state, runtime, status, summed);
   const efficiency = { ...(receipt.efficiency ?? {}) };
   delete efficiency.affected_exact_tokens;

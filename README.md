@@ -34,7 +34,7 @@ These points are covered by a private automated test suite that uses synthetic d
 - **Other hosts.** Only Codex (Desktop and CLI) and Claude Code are supported.
 - **Unlimited history.** At most 100,000 responses or 90 days are kept, and the 64 MiB store can evict older responses sooner (about three weeks on the maintainer's Mac); the oldest go first.
 - **Usage that never reaches the transcript.** Model calls that a Claude Code mod makes in the background, such as keep-warm pings from the cache-tax mod, are not written to the transcript, so SomesToken does not count them.
-- **Codex auto-review in turn receipts.** Codex runs an auto-review in a thread of its own. A Codex turn receipt does not include that thread's usage, even when it reads `exact`. Task and daily totals include it once the collector has read the review's thread.
+- **Codex auto-review without the Codex opt-in.** Codex runs an auto-review in a thread of its own. With Codex history collection on, a Codex turn receipt adds the usage of the turn's auto-reviews; without it, the receipt leaves them out, even when it reads `exact`. A review saved without per-response usage makes the receipt `partial`. Codex does not name the review model, so review tokens are not priced and the receipt's credits are a lower bound.
 - **Conversations without per-response usage.** Some Codex Desktop threads (seen with 0.166) store a conversation without per-response usage. SomesToken does not count them and names the gap `legacy_context_unavailable`.
 - **Effortless Codex updates.** Codex 0.164 asks you to approve SomesToken's 11 hooks again after every install or update. The Codex desktop app can skip changed hooks without offering a way to approve them ([openai/codex#37362](https://github.com/openai/codex/issues/37362)); approve them in the Codex CLI instead: run `codex`, open `/hooks`, approve and quit.
 
@@ -101,7 +101,7 @@ node plugins/somestoken/bin/console.mjs --view=tasks
 
 Hooks and reports make no model calls, send no telemetry and upload nothing. The collector asks the locally installed Codex app-server for account quota, and Codex may contact OpenAI to answer. SomesToken does not call a billing API or scrape a dashboard.
 
-With your opt-in, the collector reads Codex's saved sessions and Claude Code's transcripts (`~/.claude/projects`) to extract usage numbers; it does not copy them. Stored reports keep counters, timestamps, model names, fixed reason codes and hashed identities. They exclude prompts, responses, reasoning, source code, diffs, tool output, secrets, raw transcripts, working directories, absolute paths and account identifiers.
+With your opt-in, the collector reads Codex's saved sessions and Claude Code's transcripts (`~/.claude/projects`) to extract usage numbers; it does not copy them. With the Codex opt-in, the Codex Stop hook also reads the auto-review sessions that Codex saved during the turn, for the same numbers. Stored reports keep counters, timestamps, model names, fixed reason codes and hashed identities. They exclude prompts, responses, reasoning, source code, diffs, tool output, secrets, raw transcripts, working directories, absolute paths and account identifiers.
 
 Two places keep more, and both stay on your machine:
 
