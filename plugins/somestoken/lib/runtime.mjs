@@ -577,7 +577,7 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
     return { valid: false, ambiguous: false, reason: source.unreadable ? 'transcript-unavailable' : 'unsupported-transcript', metadata: prior?.metadata, ponytail: parsed.ponytail };
   }
   const current = parsed.latest.usage;
-  const previous = prior?.usage;
+  const previous = identity.baseline ?? prior?.usage;
   const delta = deltaUsage(previous, current);
   const reset = Boolean(previous && delta === null);
   const compactionBoundary = parsed.compactions > (prior?.compaction_count ?? 0);
@@ -1754,7 +1754,8 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   attachScopeChildren(state, input, turn, runtime);
 
   const main = preferredStructured?{valid:false,ambiguous:false,metadata:hookMetadata(input,'main')}:mainKey && mainSourceId
-    ? updateThread(state, mainKey, input.transcript_path, mainSourceId, mainSnapshot, { runtime, session_id: input.session_id, turn_id:input.turn_id })
+    ? updateThread(state, mainKey, input.transcript_path, mainSourceId, mainSnapshot, { runtime, session_id: input.session_id, turn_id:input.turn_id,
+      baseline: runtime === 'claude' && claudePromptOrdinal(state, input) === null ? state.threads[mainKey]?.resume_baseline : undefined })
     : { valid: false, ambiguous: true, reason: 'source-mismatch' };
   if(preferredStructured&&mainKey&&mainSourceId){
     const prior=state.threads[mainKey];
@@ -2099,9 +2100,15 @@ function processSessionStart(state, input, runtime = 'codex') {
   // transcript keeps the turn's earlier responses, so a thread with a baseline
   // keeps it until Stop; committing here dropped them from the turn receipt.
   if (runtime === 'claude' && input.source === 'compact' && state.threads[key]) return {};
-  const source = readSnapshots(transcriptPath, runtime, state.threads[key]?.checkpoint);
+  // A Claude resume opens a new generation, also while a turn still runs (a remote client
+  // resuming a background session). Read on from the prior generation's checkpoint and keep
+  // its baseline: a Stop with no prompt since the resume ends the turn that began before it.
+  const prior = runtime === 'claude' && input.source === 'resume' && generation > 0 && !state.threads[key]
+    ? state.threads[threadIdentity('main', sourceIdentity(runtime, input.session_id, 'main', generation - 1))] : undefined;
+  const source = readSnapshots(transcriptPath, runtime, state.threads[key]?.checkpoint ?? prior?.checkpoint);
   if (source.unreadable || !source.parsed.latest) return {};
   const result = updateThread(state, key, transcriptPath, mainSourceId, source, { runtime, session_id: input.session_id });
+  if (result.valid && prior?.accounting_basis === CLAUDE_ACCOUNTING_BASIS) state.threads[key].resume_baseline = prior.usage;
   if (result.valid || result.current) {
     state.threads[key].metadata = mergeRuntimeMetadata(state.threads[key]?.metadata, hookMetadata(input, 'main'), source.parsed.metadata);
   }

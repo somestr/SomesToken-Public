@@ -32,8 +32,10 @@ These points are covered by a private automated test suite that uses synthetic d
 - **Forecast accuracy.** Forecasts are experimental until enough of your own completed tasks calibrate them.
 - **Other platforms.** Only macOS on Apple silicon is validated. Linux and Windows are not verified.
 - **Other hosts.** Only Codex (Desktop and CLI) and Claude Code are supported.
-- **Unlimited history.** At most 100,000 responses or 90 days are kept; the oldest go first.
+- **Unlimited history.** At most 100,000 responses or 90 days are kept, and the 64 MiB store can evict older responses sooner (about three weeks on the maintainer's Mac); the oldest go first.
 - **Usage that never reaches the transcript.** Model calls that a Claude Code mod makes in the background, such as keep-warm pings from the cache-tax mod, are not written to the transcript, so SomesToken does not count them.
+- **Codex auto-review in turn receipts.** Codex runs an auto-review in a thread of its own. A Codex turn receipt does not include that thread's usage, even when it reads `exact`. Task and daily totals include it once the collector has read the review's thread.
+- **Conversations without per-response usage.** Some Codex Desktop threads (seen with 0.166) store a conversation without per-response usage. SomesToken does not count them and names the gap `legacy_context_unavailable`.
 - **Effortless Codex updates.** Codex 0.164 asks you to approve SomesToken's 11 hooks again after every install or update. The Codex desktop app can skip changed hooks without offering a way to approve them ([openai/codex#37362](https://github.com/openai/codex/issues/37362)); approve them in the Codex CLI instead: run `codex`, open `/hooks`, approve and quit.
 
 ## Requirements

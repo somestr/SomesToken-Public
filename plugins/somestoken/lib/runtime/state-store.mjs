@@ -664,6 +664,7 @@ export function recoverState(value, options = {}) {
     if (!/^(?:main|subagent):[a-f0-9]{20}$/.test(key)) continue;
     const sourceId = key.slice(key.indexOf(':') + 1);
     const checkpoint = persistedClaudeCheckpoint(entry.checkpoint, runtime);
+    const resumeBaseline = persistedUsage(entry.resume_baseline, runtime);
     state.threads[key] = {
       schema_version: SCHEMA_VERSION,
       thread_id: key,
@@ -673,6 +674,7 @@ export function recoverState(value, options = {}) {
       ponytail: persistedPonytail(entry.ponytail),
       ...(['claude_full_v1',CLAUDE_ACCOUNTING_BASIS,'structured_hook_v1'].includes(entry.accounting_basis) ? { accounting_basis:entry.accounting_basis } : {}),
       ...(checkpoint ? { checkpoint } : {}),
+      ...(resumeBaseline ? { resume_baseline: resumeBaseline } : {}),
       compaction_count: Number.isSafeInteger(entry.compaction_count) && entry.compaction_count >= 0 ? entry.compaction_count : 0,
       updated_at: persistedTime(entry.updated_at),
     };
