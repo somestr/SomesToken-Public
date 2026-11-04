@@ -2131,10 +2131,11 @@ function processSessionStart(state, input, runtime = 'codex') {
   const mainSourceId = sourceIdentity(runtime, input.session_id, 'main', generation);
   const key = threadIdentity('main', mainSourceId);
   if (!key || !mainSourceId) return {};
-  // Claude Code compacts mid-turn and then fires SessionStart "compact". The
-  // transcript keeps the turn's earlier responses, so a thread with a baseline
-  // keeps it until Stop; committing here dropped them from the turn receipt.
-  if (runtime === 'claude' && input.source === 'compact' && state.threads[key]) return {};
+  // Claude Code and Codex compact mid-turn and then fire SessionStart "compact"; the
+  // turn goes on. A thread with a baseline keeps it until Stop: committing here dropped
+  // the turn's earlier responses (Claude) or its cumulative usage before the compaction
+  // (Codex), and moved the Codex auto-review window past the turn's earlier reviews.
+  if (input.source === 'compact' && state.threads[key]) return {};
   // A Claude resume opens a new generation, also while a turn still runs (a remote client
   // resuming a background session). Read on from the prior generation's checkpoint and keep
   // its baseline: a Stop with no prompt since the resume ends the turn that began before it.
