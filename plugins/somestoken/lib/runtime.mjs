@@ -1440,8 +1440,10 @@ function attachScopeChildren(state, input, turn, runtime = 'codex') {
   // attachable. Transcript paths are not an identity fallback; keep the
   // uncertainty explicit instead of mixing it into an unrelated parent.
   // A lifecycle-owned child from another transcript scope remains pending in
-  // that scope. It is not an overflow source for this parent: treating it as
-  // one would make unrelated exact turns look partial without any token link.
+  // that scope, and its usage is not attached to this parent. Only its start
+  // counts here, once (below): Codex runs SubagentStart in the spawned agent's
+  // session with that agent's own turn id, so no spawned agent ever matches the
+  // scope of the turn that started it.
   const target = scope ?? ensureScope(state, targetScopeId);
   // Keep the most recent parent boundary even when it has no child yet. Hook
   // commands for a single host turn may reach us out of order; a same-turn
@@ -1454,6 +1456,15 @@ function attachScopeChildren(state, input, turn, runtime = 'codex') {
     delete target.parent_turn;
   }
   turn.overflow_count = Math.max(turn.overflow_count ?? 0, target.overflow_count ?? 0);
+  // A child started in this session since its last main Stop, from another
+  // scope, did unjoined work: this receipt reads partial. Links stored before
+  // beta 137 carry no flag and count nowhere.
+  for (const link of Object.values(state.agent_scopes)) {
+    if (link.awaiting_parent_stop !== true || link.session !== sessionHash
+      || (Number.isSafeInteger(link.session_generation) ? link.session_generation : 0) !== generation) continue;
+    if (link.source_scope !== targetScopeId) turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, turn.overflow_count + 1);
+    delete link.awaiting_parent_stop;
+  }
   if (openAgents.length > 0) {
     target.closed = false;
     for (const [agentHash, link] of openAgents.slice(0, MAX_AGENTS_PER_TURN)) {
@@ -2075,6 +2086,8 @@ function processSubagentStart(state, input, runtime = 'codex', env = {}) {
     session_generation: generation,
     status: 'pending',
     open: true,
+    // Cleared by the session's next main Stop, which counts this start (attachScopeChildren).
+    awaiting_parent_stop: true,
     updated_at: timestamp(),
   };
   scope.updated_at = timestamp();

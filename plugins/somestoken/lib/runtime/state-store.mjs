@@ -861,6 +861,7 @@ export function recoverState(value, options = {}) {
       session_generation: persistedGeneration(entry.session_generation),
       status: ['completed', 'pending', 'stopped'].includes(entry.status) ? entry.status : 'unavailable',
       open: entry.open === true,
+      ...(entry.awaiting_parent_stop === true ? { awaiting_parent_stop: true } : {}),
       updated_at: persistedTime(entry.updated_at),
     };
   }
