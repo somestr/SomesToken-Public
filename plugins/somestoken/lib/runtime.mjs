@@ -2,7 +2,7 @@ import { activePolicyHookContext, activeTaskPolicy } from './optimization/active
 import { handoffHookResponse, rememberPluginData } from './handoff/hook.mjs';
 import { recordLifecycleEvent, DEVELOPMENT_CONTEXT } from './optimization/lifecycle-checks.mjs';
 import { captureTaskForecastProfile } from './task-profiles.mjs';
-import { workspaceDirectory, readWorkspaceFile } from './workspace-usage.mjs';
+import { workspaceDirectory, readWorkspaceFile, codexConsentEnvironment } from './workspace-usage.mjs';
 import { configuredCodexLedgerRoot } from './codex-ledger.mjs';
 import { codexReviewUsage } from './runtime/codex-reviews.mjs';
 import { configuredClaudeWorkspaceRoot } from './claude-workspace.mjs';
@@ -1763,9 +1763,9 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   // Codex fires no subagent hook for an auto-review. Read before updateThread commits the thread:
   // a review of this turn changed its rollout after that commit. Structured Stop usage (never seen on
   // the maintainer's Mac) might already hold the reviews, so that path is left as it was.
-  // Only the collector's own persistent opt-in ($CODEX_HOME or ~/.codex) allows this read, so a
-  // revocation always reaches it; the installation-local copy that other hook paths accept does not.
-  const codexHome = env.CODEX_HOME ?? (env.HOME ? path.join(env.HOME, '.codex') : undefined);
+  // Only the collector's own persistent opt-in ($CODEX_HOME or ~/.codex) allows this read, never an
+  // installation-local copy, so a revocation always reaches it.
+  const { CODEX_HOME: codexHome } = codexConsentEnvironment(env);
   const reviewRoot = runtime === 'codex' && !preferredStructured && codexHome ? configuredCodexLedgerRoot({ CODEX_HOME: codexHome }) : null;
   const reviews = reviewRoot ? codexReviewUsage({ root: reviewRoot, transcriptPath: input.transcript_path,
     sessionId: input.session_id, turnId: input.turn_id, since: state.threads[mainKey]?.updated_at }) : null;
@@ -2679,7 +2679,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
       }
       if (!efficiency?.missing_session_identity && !efficiency?.late_event) {
         if(['SessionStart','UserPromptSubmit'].includes(name)
-          &&(runtime==='codex'?configuredCodexLedgerRoot(hookEnv,hookEnv.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(hookEnv)))
+          &&(runtime==='codex'?configuredCodexLedgerRoot(codexConsentEnvironment(hookEnv),hookEnv.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(hookEnv)))
           captureTaskForecastProfile(workspaceDirectory(hookEnv),input??{},runtime,name);
         const policyContext = activePolicyHookContext(state.optimization.active_policies, {
           host: runtime, session_id: input?.session_id, cwd: input?.cwd, event: name, source: input?.source,
@@ -2687,7 +2687,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
         if (policyContext) response.hookSpecificOutput = policyContext;
         if(['SessionStart','UserPromptSubmit','PostCompact','Stop','StopFailure','SessionEnd'].includes(name)){
           const selection=activeTaskPolicy(state.optimization.active_policies,{host:runtime,session_id:input?.session_id,cwd:input?.cwd});
-          const enabled=Boolean(runtime==='codex'?configuredCodexLedgerRoot(hookEnv,hookEnv.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(hookEnv));
+          const enabled=Boolean(runtime==='codex'?configuredCodexLedgerRoot(codexConsentEnvironment(hookEnv),hookEnv.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(hookEnv));
           const lifecycle=recordLifecycleEvent(state.optimization.lifecycle_checks,{
             host:runtime,session_id:input?.session_id,event:name,source:input?.source,
             duplicateStart:efficiency?.duplicate_session_start===true,developmentRequired:selection?.development_required===true,

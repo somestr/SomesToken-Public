@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { configuredClaudeWorkspaceRoot } from '../lib/claude-workspace.mjs';
 import { configuredCodexLedgerRoot } from '../lib/codex-ledger.mjs';
+import { codexConsentEnvironment } from '../lib/workspace-usage.mjs';
 import { recordedPluginData } from '../lib/handoff/hook.mjs';
 import { isHostOwnedAbsolutePath } from '../lib/host-paths.mjs';
 import { spawnSync } from 'node:child_process';
@@ -168,7 +169,7 @@ export function handleRequest(message, env = process.env, options = {}) {
       let reportEnv = env;
       if (expectedHost === 'codex' && !env.SOMESTOKEN_CODEX_SESSION_ROOT) {
         const configurationRoot=options.pluginRoot ?? env.PLUGIN_ROOT ?? (env.PLUGIN_DATA ? null : PACKAGE_ROOT);
-        const root=configuredCodexLedgerRoot(env,configurationRoot);
+        const root=configuredCodexLedgerRoot(codexConsentEnvironment(env),configurationRoot);
         if(root) reportEnv={...env,SOMESTOKEN_CODEX_SESSION_ROOT:root};
       }
       // Codex starts plugin MCP servers without PLUGIN_DATA; use the folder its hook recorded.

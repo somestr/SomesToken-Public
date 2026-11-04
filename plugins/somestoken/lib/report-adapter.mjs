@@ -1,4 +1,4 @@
-import {workspaceDirectory,readWorkspaceFile,readWorkspaceSnapshot,publicWorkspace,workspaceTaskReport} from './workspace-usage.mjs';
+import {workspaceDirectory,readWorkspaceFile,readWorkspaceSnapshot,publicWorkspace,workspaceTaskReport,codexConsentEnvironment} from './workspace-usage.mjs';
 import {workspaceDiagnostics,runtimeCompatibility,installedPackageVersion} from './workspace-diagnostics.mjs';
 import { readConsumption } from './consumption.mjs';
 import { configuredClaudeWorkspaceRoot } from './claude-workspace.mjs';
@@ -473,8 +473,8 @@ export function readSomesTokenReport(env, request, options = {}) {
   if (request.hosts === 'all') options = { ...options, workspaceAllHosts: true };
   const host=options.expectedHost ?? (reportRuntime(env)==='claude'?'claude':'codex');
   const configurationRoot=options.pluginRoot ?? reportEnvironmentContext(env).env.PLUGIN_ROOT;
-  const workspaceEnabled=(host==='claude'?configuredClaudeWorkspaceRoot(env):configuredCodexLedgerRoot(env,configurationRoot))
-    || (options.workspaceAllHosts===true&&(configuredClaudeWorkspaceRoot(env)||configuredCodexLedgerRoot(env,configurationRoot)));
+  const workspaceEnabled=(host==='claude'?configuredClaudeWorkspaceRoot(env):configuredCodexLedgerRoot(codexConsentEnvironment(env),configurationRoot))
+    || (options.workspaceAllHosts===true&&(configuredClaudeWorkspaceRoot(env)||configuredCodexLedgerRoot(codexConsentEnvironment(env),configurationRoot)));
   const workspaceState=workspaceEnabled&&['tasks','daily','task-forecast','task','diagnostics'].includes(request.mode)
     ?readWorkspaceSnapshot(workspaceDirectory(env),{
       includeRecords:request.mode==='task'&&Boolean(options.workspaceTask),

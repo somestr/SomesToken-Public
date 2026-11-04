@@ -24,6 +24,14 @@ export function workspaceDirectory(env=process.env) {
   const root=env.CODEX_HOME ?? (env.HOME ? path.join(env.HOME,'.codex') : null);
   return root && path.isAbsolute(root) ? path.join(root,'somestoken') : null;
 }
+// Codex hooks and MCP servers get PLUGIN_DATA, and CODEX_HOME only when the launching process had it.
+// configuredCodexLedgerRoot then skips ~/.codex and reads only an installation-local copy, so it gets
+// CODEX_HOME resolved as Codex resolves it: the persistent opt-in, and its revocation, win.
+// ponytail: kept out of codex-ledger.mjs, whose source the collector's parser revision hashes; fold it
+// into its configurationDirectory the next time that revision moves for a parser change.
+export function codexConsentEnvironment(env=process.env) {
+  return env.CODEX_HOME===undefined&&env.HOME ? {...env,CODEX_HOME:path.join(env.HOME,'.codex')} : env;
+}
 function validRecord(r) {
   return r && ['record_key','task_key','source_key','turn_key'].every(k=>isHashedIdentity(r[k]??''))
     && ['main','subagent'].includes(r.role) && validLabel(r.model??'') && validLabel(r.effort??'')

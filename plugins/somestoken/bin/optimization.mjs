@@ -2,7 +2,7 @@
 import { assessEfficiencyPilot, beginEfficiencyPilotEpoch } from '../lib/optimization/pilot.mjs';
 import { activePolicyStatus, policySelector, selectActivePolicy,activeTaskPolicy } from '../lib/optimization/active-policy.mjs';
 import {recordLifecycleEvent,lifecycleCheck,recordLifecycleSkills,readSkillEvidence} from '../lib/optimization/lifecycle-checks.mjs';
-import {workspaceDirectory,readWorkspaceFile} from '../lib/workspace-usage.mjs';
+import {workspaceDirectory,readWorkspaceFile,codexConsentEnvironment} from '../lib/workspace-usage.mjs';
 import {configuredCodexLedgerRoot} from '../lib/codex-ledger.mjs';
 import {configuredClaudeWorkspaceRoot} from '../lib/claude-workspace.mjs';
 import { existsSync, realpathSync } from 'node:fs';
@@ -185,7 +185,7 @@ async function main(argv) {
     const proof=action==='skills'?readSkillEvidence(value(args,'--evidence'),value(args,'--stage')):null;
     if(proof&&!proof.ok){output(proof,json);process.exitCode=2;return;}
     const refresh=optimization=>{
-      const enabled=Boolean(identity.host==='codex'?configuredCodexLedgerRoot(process.env,process.env.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(process.env));
+      const enabled=Boolean(identity.host==='codex'?configuredCodexLedgerRoot(codexConsentEnvironment(process.env),process.env.PLUGIN_ROOT):configuredClaudeWorkspaceRoot(process.env));
       const selection=activeTaskPolicy(optimization.active_policies,{...identity,cwd:process.cwd()});
       recordLifecycleEvent(optimization.lifecycle_checks,{...identity,event:action==='begin'?'SessionStart':'Check',
         developmentRequired:selection?.development_required===true||lifecycleCheck(optimization.lifecycle_checks,identity).development_required===true,
