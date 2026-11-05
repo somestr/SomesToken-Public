@@ -183,33 +183,36 @@ export function pluginDataRoot(env = {}) {
   return roots.length === 1 ? roots[0] : null;
 }
 
-export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
-  return readTail(filePath, maxBytes, MAX_TAIL_BYTES);
-}
-
-// `ceiling` is the hard byte bound; only this module reads past MAX_TAIL_BYTES.
-function readTail(filePath, maxBytes, ceiling) {
-  if (typeof filePath !== 'string' || filePath.length === 0) {
-    return { text: '', unreadable: true, truncated: false };
-  }
-  let fd;
+// Host transcript paths are input, not an authority to follow arbitrary
+// links. Fail closed when the platform cannot give the opened descriptor
+// a no-follow guarantee; a missing token snapshot is safer than reading a
+// redirected local file. Returns the descriptor and size of a regular file.
+function openTranscript(filePath) {
+  if (typeof filePath !== 'string' || filePath.length === 0) throw new Error('transcript-path-missing');
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (!Number.isSafeInteger(noFollow)) throw new Error('no-follow-unavailable');
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | fs.constants.O_NONBLOCK);
   try {
-    // Host transcript paths are input, not an authority to follow arbitrary
-    // links. Fail closed when the platform cannot give the opened descriptor
-    // a no-follow guarantee; a missing token snapshot is safer than reading a
-    // redirected local file.
-    const noFollow = fs.constants.O_NOFOLLOW;
-    if (!Number.isSafeInteger(noFollow)) throw new Error('no-follow-unavailable');
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | fs.constants.O_NONBLOCK);
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || !Number.isSafeInteger(stat.size) || stat.size < 0) {
       throw new Error('transcript-not-regular-file');
     }
+    return { fd, size: stat.size };
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
+export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
+  let fd;
+  try {
+    let size;
+    ({ fd, size } = openTranscript(filePath));
     const requestedBytes = Number.isSafeInteger(maxBytes) && maxBytes >= 0
       ? maxBytes
-      : ceiling;
-    const size = stat.size;
-    const length = Math.min(size, requestedBytes, ceiling);
+      : MAX_TAIL_BYTES;
+    const length = Math.min(size, requestedBytes, MAX_TAIL_BYTES);
     const buffer = Buffer.alloc(length);
     if (length) fs.readSync(fd, buffer, 0, length, Math.max(0, size - length));
     let text = buffer.toString('utf8');
@@ -229,9 +232,66 @@ function readTail(filePath, maxBytes, ceiling) {
   }
 }
 
+// A Codex turn longer than the tail keeps its total there but not its first records (turns of 8.6 MB on
+// 2026-11-04, 204 MiB on 2026-10-31). codexTurnRecords reads the rollout backward in chunks and keeps
+// only the lines that can be usage records, down to the line that started the turn, the start of the
+// file or CODEX_TURN_SCAN_BYTES. Memory stays at one chunk, one line and the kept lines.
+const CODEX_TURN_SCAN_BYTES = 512 * 1024 * 1024, CODEX_SCAN_CHUNK_BYTES = 8 * 1024 * 1024;
+const CODEX_SCAN_LINE_BYTES = 64 * 1024 * 1024, CODEX_RECORD_LINE_BYTES = 64 * 1024;
+const RECORD_MARK = Buffer.from('"token_usage_record"'), TURN_START_MARK = Buffer.from('"task_started"');
+
+// Returns the kept lines in file order, or null when the rollout cannot be read within the bounds.
+function codexTurnRecords(filePath, turnId) {
+  let fd;
+  try {
+    let size;
+    ({ fd, size } = openTranscript(filePath));
+    const parts = [];
+    let end = size, carry = Buffer.alloc(0), keptBytes = 0, started = false;
+    while (!started && end > 0 && size - end < CODEX_TURN_SCAN_BYTES) {
+      const start = Math.max(0, end - CODEX_SCAN_CHUNK_BYTES), chunk = Buffer.alloc(end - start);
+      for (let read = 0, n; read < chunk.length; read += n) {
+        if (!(n = fs.readSync(fd, chunk, read, chunk.length - read, start + read))) return null;
+      }
+      const data = carry.length ? Buffer.concat([chunk, carry]) : chunk;
+      end = start;
+      // The bytes before the first newline belong to a line that began earlier.
+      const from = start > 0 ? data.indexOf(10) + 1 : 0;
+      if (start > 0 && from === 0) {
+        if (data.length > CODEX_SCAN_LINE_BYTES) return null;
+        carry = data;
+        continue;
+      }
+      carry = Buffer.from(data.subarray(0, from));
+      const lines = [];
+      const scan = (mark, take) => {
+        for (let at = data.indexOf(mark, from); at >= 0;) {
+          const head = data.lastIndexOf(10, at) + 1, next = data.indexOf(10, at), tail = next < 0 ? data.length : next;
+          if (tail - head <= CODEX_RECORD_LINE_BYTES) take(data.toString('utf8', head, tail));
+          at = next < 0 ? -1 : data.indexOf(mark, tail);
+        }
+      };
+      scan(RECORD_MARK, (line) => { lines.push(line); keptBytes += line.length; });
+      if (keptBytes > CODEX_SCAN_LINE_BYTES) return null;
+      scan(TURN_START_MARK, (line) => {
+        try {
+          const event = JSON.parse(line);
+          if (event?.type === 'event_msg' && event.payload?.type === 'task_started' && event.payload.turn_id === turnId) started = true;
+        } catch { /* not an event line */ }
+      });
+      parts.push(lines);
+    }
+    return parts.reverse().flat().join('\n');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* fail open */ }
+    }
+  }
+}
+
 const CLAUDE_READ_BYTES = 64 * 1024 * 1024;
-// A Codex turn read once more when the tail cut it off (updateThread) has the same bound.
-const CODEX_TURN_READ_BYTES = CLAUDE_READ_BYTES;
 const CLAUDE_CHECKPOINT_FROM_BYTES = 32 * 1024 * 1024;
 const CLAUDE_TAIL_BYTES = 4 * 1024 * 1024;
 const snapshotCount = (parsed) => parsed?.snapshot_count ?? parsed?.snapshots?.length ?? 0;
@@ -612,11 +672,10 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
       t.session === hashOpaqueHostIdentifier(identity.session_id, 'ledger:session')
       && t.turn === hashOpaqueHostIdentifier(identity.turn_id, 'ledger:turn')) ?? [];
     let matches = own(parsed.ledger);
-    // A turn longer than the tail keeps its total there but not its first records, so they cannot
-    // reconcile (an 8.6 MB turn on 2026-11-04): read once more, bounded, for this turn alone.
+    // A turn longer than the tail cannot reconcile there: read its own records back to its start.
     if (source.truncated && !(matches.length === 1 && matches[0].status === 'exact')) {
-      const wide = readTail(transcriptPath, CODEX_TURN_READ_BYTES, CODEX_TURN_READ_BYTES);
-      const found = wide.unreadable ? [] : own(parseTokenSnapshots(wide.text).ledger);
+      const records = codexTurnRecords(transcriptPath, identity.turn_id);
+      const found = records === null ? [] : own(parseTokenSnapshots(records).ledger);
       if (found.length === 1) matches = found;
     }
     const turn = matches.length === 1 ? matches[0] : null;
