@@ -184,6 +184,11 @@ export function pluginDataRoot(env = {}) {
 }
 
 export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
+  return readTail(filePath, maxBytes, MAX_TAIL_BYTES);
+}
+
+// `ceiling` is the hard byte bound; only this module reads past MAX_TAIL_BYTES.
+function readTail(filePath, maxBytes, ceiling) {
   if (typeof filePath !== 'string' || filePath.length === 0) {
     return { text: '', unreadable: true, truncated: false };
   }
@@ -202,9 +207,9 @@ export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
     }
     const requestedBytes = Number.isSafeInteger(maxBytes) && maxBytes >= 0
       ? maxBytes
-      : MAX_TAIL_BYTES;
+      : ceiling;
     const size = stat.size;
-    const length = Math.min(size, requestedBytes, MAX_TAIL_BYTES);
+    const length = Math.min(size, requestedBytes, ceiling);
     const buffer = Buffer.alloc(length);
     if (length) fs.readSync(fd, buffer, 0, length, Math.max(0, size - length));
     let text = buffer.toString('utf8');
@@ -225,6 +230,8 @@ export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
 }
 
 const CLAUDE_READ_BYTES = 64 * 1024 * 1024;
+// A Codex turn read once more when the tail cut it off (updateThread) has the same bound.
+const CODEX_TURN_READ_BYTES = CLAUDE_READ_BYTES;
 const CLAUDE_CHECKPOINT_FROM_BYTES = 32 * 1024 * 1024;
 const CLAUDE_TAIL_BYTES = 4 * 1024 * 1024;
 const snapshotCount = (parsed) => parsed?.snapshot_count ?? parsed?.snapshots?.length ?? 0;
@@ -601,9 +608,17 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
     return {valid:false,ambiguous:true,reason:'identity-rebaseline',current,metadata:parsed.metadata};
   }
   if (identity.runtime === 'codex' && parsed.ledger?.present && identity.turn_id) {
-    const matches = parsed.ledger.turns.filter(t =>
+    const own = (ledger) => ledger?.turns?.filter(t =>
       t.session === hashOpaqueHostIdentifier(identity.session_id, 'ledger:session')
-      && t.turn === hashOpaqueHostIdentifier(identity.turn_id, 'ledger:turn'));
+      && t.turn === hashOpaqueHostIdentifier(identity.turn_id, 'ledger:turn')) ?? [];
+    let matches = own(parsed.ledger);
+    // A turn longer than the tail keeps its total there but not its first records, so they cannot
+    // reconcile (an 8.6 MB turn on 2026-11-04): read once more, bounded, for this turn alone.
+    if (source.truncated && !(matches.length === 1 && matches[0].status === 'exact')) {
+      const wide = readTail(transcriptPath, CODEX_TURN_READ_BYTES, CODEX_TURN_READ_BYTES);
+      const found = wide.unreadable ? [] : own(parseTokenSnapshots(wide.text).ledger);
+      if (found.length === 1) matches = found;
+    }
     const turn = matches.length === 1 ? matches[0] : null;
     if (!turn?.usage || turn.status === 'unavailable') return {valid:false,ambiguous:true,reason:'source-mismatch',current,metadata:parsed.metadata};
     // The explicit host turn total is independent of a legacy cumulative
