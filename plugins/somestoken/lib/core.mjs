@@ -413,6 +413,8 @@ export function createCodexLedgerReader({legacy = false, state = null} = {}) {
         present, invalid, latest, metadata, sourceThread, sourceSession, legacyTurn, threadTier};
     },
     resetContext(threadId=null,sessionId=null) { contexts.clear();contextRoots.clear(); metadata=null; threadTier=null; sourceThread=id(threadId, 'thread');sourceSession=id(sessionId,'session');legacyTurn=null;legacyPrevious.delete(sourceThread); },
+    // The thread's counter carries on from this inherited one: a later counter that only repeats its total is no new response.
+    seedLegacyCounter(event) { const info=event?.payload?.info,total=legacyUsage(info?.total_token_usage),last=legacyUsage(info?.last_token_usage); if(legacy&&sourceThread&&total&&last)legacyPrevious.set(sourceThread,{total,last}); },
     accept(event) {
       const p = event?.payload;
       if (event?.type === 'session_meta') { contexts.clear();contextRoots.clear(); metadata=null; threadTier=null; sourceThread=id(p?.id, 'thread');sourceSession=id(p?.session_id,'session');legacyTurn=null; }

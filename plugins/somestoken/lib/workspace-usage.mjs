@@ -544,17 +544,26 @@ function movedResponses(pairs,recordDayKey) {
   }
   return {groups,keys};
 }
-function correctPriorDays(freshDays,{previous,timeZone,retainedDay,wholeAfter=null,priorGroups,retiredGroups,moved,priorByKey,scan,globalGaps,taskMetadata,unverifiedTasks,rowsForDays}) {
+// Once a Codex day row predates the oldest stored Codex response's day (any stored response's, when no Codex one
+// is left), responses have left the store oldest first. A Codex response read again from its source that is older
+// still (as after a parser revision change) stays out: stored again, it would make the next capture read the
+// days after it as whole.
+const codexFloor=(previous,timeZone,localDay,bound)=>Number.isFinite(bound)&&previous?.time_zone===timeZone&&Array.isArray(previous?.daily)
+  &&previous.daily.some(d=>(d?.host??'codex')==='codex'&&typeof d.date==='string'&&d.date<localDay(bound))?bound:-Infinity;
+function correctPriorDays(freshDays,{previous,timeZone,retainedDay,wholeAfter=null,priorHeld=wholeAfter!==null,priorGroups,retiredGroups,moved,priorByKey,scan,globalGaps,taskMetadata,unverifiedTasks,rowsForDays}) {
   const priorDays=new Map(priorDailyRows(previous,timeZone,retainedDay).map(d=>[dayKey(d),d]));
   const freshByDay=new Map(freshDays.map(d=>[dayKey(d),d]));
   const pending=[];
   for(const [key,old] of priorDays){
     const fresh=freshByDay.get(key),gone=(retiredGroups.get(key)?.length??0)+(moved.groups.get(key)?.length??0);
-    // The prior snapshot held whole every day after its oldest response's day, so there its responses are the
-    // day's: a Codex row they do not support counted responses that moved before beta 134 subtracted moves.
+    // The prior snapshot held whole every day after its oldest Codex response's day (`wholeAfter`), so there its
+    // responses are the day's: a Codex row they do not support counted responses that moved before beta 134
+    // subtracted moves. A Claude response does not bound it: it can stay stored after older Codex ones left.
     const whole=wholeAfter!==null&&old.date>wholeAfter&&(old.host??'codex')==='codex';
     if(!fresh&&(whole||gone>=old.response_count&&gone===priorGroups.get(key)))continue;
-    const fullyObserved=whole||scan.record_inventory_complete===true&&(old.host??'codex')==='codex'&&!globalGaps.length&&!(taskMetadata.get(old.task_key)?.coverage_gaps??[]).length&&!unverifiedTasks.has(old.task_key);
+    // A complete scan proves a day's responses only where the store still holds them all: on the oldest,
+    // partly evicted day the fresh group lacks the evicted ones, and unchanged sources are not read again.
+    const fullyObserved=whole||!priorHeld&&scan.record_inventory_complete===true&&(old.host??'codex')==='codex'&&!globalGaps.length&&!(taskMetadata.get(old.task_key)?.coverage_gaps??[]).length&&!unverifiedTasks.has(old.task_key);
     if(fresh&&((priorGroups.get(key)??0)>=old.response_count||fullyObserved))continue;
     pending.push([key,old]);
   }
@@ -736,8 +745,10 @@ export function updateWorkspace(previous,scan,{now=Date.now(),timeZone='UTC',quo
   // Upsert first, then normalize each retained identity once. Most poll records
   // already exist in priorRecords; cloning both versions wastes memory and CPU.
   // Dates far from the retention boundary need no per-record timezone format.
+  let oldest=Infinity,codexOldest=Infinity;for(const r of priorRecords)if(validRecord(r)){oldest=Math.min(oldest,r.observed_at);if(r.host!=='claude')codexOldest=Math.min(codexOldest,r.observed_at);}
+  const floor=codexFloor(previous,timeZone,localDay,codexOldest<Infinity?codexOldest:oldest);
   for(const source of [priorRecords,incomingRecords])for(const r of source) {
-    if(!validRecord(r)||retiredLegacy(r)||r.observed_at>now||r.observed_at<cutoff-2*DAY)continue;
+    if(!validRecord(r)||retiredLegacy(r)||r.observed_at>now||r.observed_at<cutoff-2*DAY||r.host!=='claude'&&r.observed_at<floor)continue;
     if(r.observed_at<cutoff+2*DAY&&localDay(r.observed_at)<retainedDay)continue;
     records.set(r.record_key,r);
   }
@@ -779,11 +790,11 @@ export function updateWorkspace(previous,scan,{now=Date.now(),timeZone='UTC',quo
   let freshDays;try{freshDays=grouped(ordered,['date','task_key','host','role','model','effort','service_tier'],(r,key)=>key==='date'?localDay(r.observed_at):r[key]);}catch{throw new Error('invalid-timezone');}
   const recordDayKey=r=>recordDayKeyOf(r,localDay);
   const priorByKey=new Map();for(const r of priorRecords)if(validRecord(r))priorByKey.set(r.record_key,r);
-  let oldest=Infinity;const priorGroups=new Map(),retiredGroups=new Map();for(const r of priorByKey.values()){const key=recordDayKey(r);oldest=Math.min(oldest,r.observed_at);priorGroups.set(key,(priorGroups.get(key)??0)+1);if(retiredLegacy(r)){const retired=retiredGroups.get(key)??[];retired.push(r);retiredGroups.set(key,retired);}}
+  const priorGroups=new Map(),retiredGroups=new Map();for(const r of priorByKey.values()){const key=recordDayKey(r);priorGroups.set(key,(priorGroups.get(key)??0)+1);if(retiredLegacy(r)){const retired=retiredGroups.get(key)??[];retired.push(r);retiredGroups.set(key,retired);}}
   // A copy the prior snapshot held is in its saved day total; one that just arrived is not.
   const copyKeys=new Set();for(const c of copies){copyKeys.add(c.record_key);const r=priorByKey.get(c.record_key);if(r){const key=recordDayKey(r),retired=retiredGroups.get(key)??[];retired.push(r);retiredGroups.set(key,retired);}}
   const moved=movedResponses(incomingRecords.filter(r=>validRecord(r)&&!copyKeys.has(r.record_key)).map(r=>[r,priorByKey.get(r.record_key)]),recordDayKey);
-  freshDays=correctPriorDays(freshDays,{previous,timeZone,retainedDay,wholeAfter:oldest<Infinity?localDay(oldest):null,priorGroups,retiredGroups,moved,priorByKey,scan,globalGaps,taskMetadata,
+  freshDays=correctPriorDays(freshDays,{previous,timeZone,retainedDay,wholeAfter:codexOldest<Infinity?localDay(codexOldest):null,priorHeld:oldest<Infinity,priorGroups,retiredGroups,moved,priorByKey,scan,globalGaps,taskMetadata,
     unverifiedTasks:new Set(ordered.filter(r=>r.validation_status==='historical_unverified').map(r=>r.task_key)),
     rowsForDays:keys=>{const newByDay=new Map();for(const r of incomingRecords){if(!validRecord(r)||copyKeys.has(r.record_key))continue;const key=recordDayKey(r);if(!keys.has(key))continue;const g=newByDay.get(key)??[];g.push(r);newByDay.set(key,g);}return newByDay;}});
   const todayCutoff=localDay(cutoff);
@@ -838,14 +849,14 @@ export function confirmedClaudeRow(r,confirmation) {
  * every row; the collector gathers them while it streams those rows once.
  */
 export function priorWorkspaceFacts(timeZone) {
-  const localDay=minuteDay(timeZone),priorGroups=new Map(),invalidUsageTasks=new Map();let canonical=true,oldest=Infinity;
+  const localDay=minuteDay(timeZone),priorGroups=new Map(),invalidUsageTasks=new Map();let canonical=true,oldest=Infinity,codexOldest=Infinity;
   return {
     add(r) {
       if(!canonicalRecord(r))canonical=false;
       if(isHashedIdentity(r?.task_key??'')&&!isValidUsage(r?.usage,{reasoningObserved:r?.host!=='claude'}))invalidUsageTasks.set(r.task_key,r.host==='claude'?'claude':'codex');
-      if(validRecord(r)){const key=recordDayKeyOf(r,localDay);priorGroups.set(key,(priorGroups.get(key)??0)+1);oldest=Math.min(oldest,r.observed_at);}
+      if(validRecord(r)){const key=recordDayKeyOf(r,localDay);priorGroups.set(key,(priorGroups.get(key)??0)+1);oldest=Math.min(oldest,r.observed_at);if(r.host!=='claude')codexOldest=Math.min(codexOldest,r.observed_at);}
     },
-    get facts(){return {priorGroups,invalidUsageTasks,canonical,oldest};},
+    get facts(){return {priorGroups,invalidUsageTasks,canonical,oldest,codexOldest};},
   };
 }
 
@@ -875,7 +886,8 @@ function writeWorkspaceStreamingOnce(directory,{previous,priorFacts,priorPass,sc
   for(const row of incoming)if(validRecord(row)){if(incomingByKey.has(row.record_key))return fail('duplicate_incoming_identity');incomingByKey.set(row.record_key,row);}
   const replacements=new Set((Array.isArray(scan.legacy_replacements)?scan.legacy_replacements:[]).filter(r=>isHashedIdentity(r.source_key??'')&&(r.turn_key===null||isHashedIdentity(r.turn_key??''))).map(r=>r.source_key+':'+(r.turn_key??'*')));
   const retiredLegacy=r=>r.host!=='claude'&&r.record_basis==='legacy_counter_event'&&(replacements.has(r.source_key+':*')||replacements.has(r.source_key+':'+r.turn_key));
-  const passes=r=>validRecord(r)&&!retiredLegacy(r)&&r.observed_at<=now&&r.observed_at>=cutoff-2*DAY&&!(r.observed_at<cutoff+2*DAY&&localDay(r.observed_at)<retainedDay);
+  const floor=codexFloor(previous,timeZone,localDay,Number.isFinite(priorFacts?.codexOldest)?priorFacts.codexOldest:priorFacts?.oldest);
+  const passes=r=>validRecord(r)&&!retiredLegacy(r)&&r.observed_at<=now&&r.observed_at>=cutoff-2*DAY&&!(r.observed_at<cutoff+2*DAY&&localDay(r.observed_at)<retainedDay)&&!(r.host!=='claude'&&r.observed_at<floor);
   const recordDayKey=r=>recordDayKeyOf(r,localDay);
   // Prior-row facts arrive in prior order, so incoming rows extend them in the same order.
   if(!priorFacts?.canonical)return fail('invalid_prior_row');
@@ -1058,7 +1070,7 @@ function writeWorkspaceStreamingOnce(directory,{previous,priorFacts,priorPass,sc
     const priorLookup=new Map();
     const moved=movedResponses([...normalizedIncoming].filter(([key])=>!copyKeys.has(key)).map(([key,row])=>[row,priorMatch.get(key)?.row]),recordDayKey);
     let freshDays=correctPriorDays(dayGroups.sort((a,b)=>a.first-b.first).map(group=>group.day),{previous,timeZone,retainedDay,
-      wholeAfter:Number.isFinite(priorFacts.oldest)?localDay(priorFacts.oldest):null,priorGroups,retiredGroups,moved,
+      wholeAfter:Number.isFinite(priorFacts.codexOldest)?localDay(priorFacts.codexOldest):null,priorHeld:Number.isFinite(priorFacts.oldest),priorGroups,retiredGroups,moved,
       priorByKey:{get:key=>priorLookup.get(key)},scan,globalGaps,taskMetadata,unverifiedTasks,
       rowsForDays:keys=>{
         const newByDay=new Map(),add=(row,prior)=>{const key=recordDayKey(row);if(!keys.has(key)||copyKeys.has(row.record_key))return;const group=newByDay.get(key)??[];group.push(row);newByDay.set(key,group);if(prior)priorLookup.set(row.record_key,prior);};

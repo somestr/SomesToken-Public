@@ -131,6 +131,15 @@ function requestOrThrow(request) {
   return { mode, last };
 }
 
+// The store keeps day rows in merge order, not date order. Return the newest
+// days, and only whole ones: a cap that cuts a day would understate it.
+function newestWholeDays(rows, limit) {
+  const ordered = [...rows].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  let start = Math.max(0, ordered.length - limit);
+  while (start > 0 && start < ordered.length && ordered[start].date === ordered[start - 1].date) start++;
+  return ordered.slice(start);
+}
+
 function stateParts(state) {
   return {
     state: state && typeof state === 'object' ? state : null,
@@ -536,7 +545,7 @@ export function readSomesTokenReport(env, request, options = {}) {
           })}:{}),
         }))};
     }
-    if(request.mode==='daily') report={...report,tasks:undefined,daily:(report.daily??[]).slice(-1000)};
+    if(request.mode==='daily') report={...report,tasks:undefined,daily:newestWholeDays(report.daily??[],1000)};
     const status=['exact','partial'].includes(report.status)?report.status:'unavailable';
     const source=state?'workspace_snapshot':'unavailable';
     const preflight=telemetryPreflight([],source,state?'available':'host_plugin_data_unavailable');

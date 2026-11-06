@@ -176,7 +176,7 @@ function streamLedger(file, budget, reader = createCodexLedgerReader(), source =
   let parsedBytes=0, lastByte=null;
   const boundedHistory=source?.historyStart!=null;
   let ownHistory=!boundedHistory,boundaryFailed=false,nextOrdinal=source?.historyBase??null,lastOrdinal=null;
-  let prefixContexts=new Map(),foreignPrefix=false;
+  let prefixContexts=new Map(),foreignPrefix=false,prefixCounter=null;
   const rejectBoundary=()=>{boundaryFailed=true;rejected=true;reader.resetContext(source?.id,source?.session);budget.incomplete=true;budget.gaps.add('inherited_history_boundary_unavailable');};
   try {
     const stat = fs.fstatSync(fd);
@@ -201,7 +201,7 @@ function streamLedger(file, budget, reader = createCodexLedgerReader(), source =
       if(check.result()===previous.digest) {
         reader=previous.reader;incremental=true;
         ownHistory=previous.ownHistory;nextOrdinal=previous.nextOrdinal;lastOrdinal=previous.lastOrdinal;
-        prefixContexts=new Map(previous.prefixContexts);foreignPrefix=previous.foreignPrefix;
+        prefixContexts=new Map(previous.prefixContexts);foreignPrefix=previous.foreignPrefix;prefixCounter=previous.prefixCounter??null;
       } else {position=0;check=changeCheck();}
     }
     if(!incremental)reader.resetContext(source?.id,source?.session);
@@ -234,8 +234,9 @@ function streamLedger(file, budget, reader = createCodexLedgerReader(), source =
                     const context=foreignPrefix?null:prefixContexts.get(event.payload.turn_id);
                     if(context)reader.accept(context);
                     reader.accept(event);
-                  }else{foreignPrefix=true;prefixContexts.clear();}
+                  }else{foreignPrefix=true;prefixContexts.clear();prefixCounter=null;}
                 }
+                else if(event.type==='event_msg'&&event.payload?.type==='token_count'&&!foreignPrefix)prefixCounter=event;
                 return;
               }
               ownHistory=true;reader.resetContext(source.id,source.session);rejected=false;
@@ -263,6 +264,14 @@ function streamLedger(file, budget, reader = createCodexLedgerReader(), source =
             budget.incomplete=true;budget.gaps.add('source_identity_mismatch');return;
           }
           reader.accept(event);return;
+        }
+        // Codex continues a review in a new rollout whose first own counter repeats the total its
+        // prefix inherited (live: 2026-10-25). Only then does the thread's counter carry on from it;
+        // a spawned agent's counter starts afresh.
+        if(prefixCounter&&event.type==='event_msg'&&event.payload?.type==='token_count'){
+          const inherited=prefixCounter.payload.info?.total_token_usage;
+          if(!rejected&&inherited&&typeof inherited==='object'&&JSON.stringify(event.payload.info?.total_token_usage)===JSON.stringify(inherited))reader.seedLegacyCounter(prefixCounter);
+          prefixCounter=null;
         }
         if(!rejected)reader.accept(event);
       }catch{if(checkingPrefix)rejectBoundary();if(structured)reader.rejectStructuredSource();budget.incomplete=true;budget.gaps.add('malformed_usage_line');}
@@ -323,7 +332,7 @@ function streamLedger(file, budget, reader = createCodexLedgerReader(), source =
       if(!stable){budget.incomplete=true;budget.gaps.add('source_changed_during_read');}
     }
     return {reader,incremental,parsedBytes,
-      cache:strong&&stable&&!rejected&&lastByte===10&&!skipped?{reader,size:stat.size,dev:stat.dev,ino:stat.ino,digest:captured,ownHistory,nextOrdinal,lastOrdinal,prefixContexts:[...prefixContexts],foreignPrefix}:null};
+      cache:strong&&stable&&!rejected&&lastByte===10&&!skipped?{reader,size:stat.size,dev:stat.dev,ino:stat.ino,digest:captured,ownHistory,nextOrdinal,lastOrdinal,prefixContexts:[...prefixContexts],foreignPrefix,prefixCounter}:null};
   } finally {chunks?.return();fs.closeSync(fd);}
 }
 
@@ -718,8 +727,8 @@ export function readCodexWorkspaceLedger(root,{cache=true,previous=null,priorSou
       const c=captured.cache;
       if(resume){
         parsedKeys.add(key);
-        // An unfinished inherited-history prefix holds whole turn_context events: never saved.
-        if(c&&!c.prefixContexts.length){
+        // An unfinished inherited-history prefix holds whole turn_context or counter events: never saved.
+        if(c&&!c.prefixContexts.length&&!c.prefixCounter){
           const entry={key,size:c.size,dev:c.dev,ino:c.ino,digest:c.digest,ownHistory:c.ownHistory,nextOrdinal:c.nextOrdinal,lastOrdinal:c.lastOrdinal,
             foreignPrefix:c.foreignPrefix,streamGaps,reader:zlib.gzipSync(JSON.stringify(c.reader.snapshot()),{level:1}).toString('base64')};
           if(JSON.stringify(entry).length<=RESUME_ENTRY_BYTES)checkpoints.push(entry);
