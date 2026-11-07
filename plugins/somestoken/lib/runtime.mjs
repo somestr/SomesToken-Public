@@ -4,7 +4,7 @@ import { recordLifecycleEvent, DEVELOPMENT_CONTEXT } from './optimization/lifecy
 import { captureTaskForecastProfile } from './task-profiles.mjs';
 import { workspaceDirectory, readWorkspaceFile, codexConsentEnvironment } from './workspace-usage.mjs';
 import { configuredCodexLedgerRoot } from './codex-ledger.mjs';
-import { codexReviewUsage } from './runtime/codex-reviews.mjs';
+import { codexChildUsage } from './runtime/codex-reviews.mjs';
 import { configuredClaudeWorkspaceRoot } from './claude-workspace.mjs';
 import { prefixCheck, prefixDigest, TRANSCRIPT_CEILING_BYTES } from './claude-capture.mjs';
 import fs from 'node:fs';
@@ -747,8 +747,13 @@ function hostUsageCoverage(runtime, authMode) {
   return 'somestoken_observed';
 }
 
-// The counted auto-review usage of a turn. Codex does not name the review model, so it stays unpriced.
-const reviewUsage = (turn) => Object.values(turn?.subagents ?? {}).find((entry) => entry?.auto_review)?.usage;
+// The counted usage of a turn that stays unpriced: Codex does not name the auto-review model, and a
+// spawned agent may run another model than its parent.
+function unpricedUsage(turn) {
+  const entries = Object.values(turn?.subagents ?? {}).filter((entry) => (entry?.auto_review || entry?.spawned_agent) && entry.usage);
+  return entries.length ? { usage: sumUsage(entries.map((entry) => entry.usage)),
+    components: [...new Set(entries.map((entry) => (entry.auto_review ? 'auto_review_tokens' : 'spawned_agent_tokens')))] } : undefined;
+}
 
 function buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced }) {
   const quality = usageQualityForStatus(status);
@@ -759,12 +764,12 @@ function buildReceiptUsageLayers({ runtime, status, summed, model, input, env, u
     : { ...tokenFields(summed), quality, coverage };
   let calculated = { quality: 'unavailable', calculation_quality: 'unavailable' };
   if (runtime === 'codex') {
-    // Unpriced review tokens leave the credits a lower bound on the rest.
-    const priced = unpriced ? deltaUsage(unpriced, summed) : undefined;
+    // Unpriced tokens leave the credits a lower bound on the rest.
+    const priced = unpriced ? deltaUsage(unpriced.usage, summed) : undefined;
     const result = priced === undefined ? calculateCodexCredits(observed, { model, quality })
       : calculateCodexCredits(priced && { ...tokenFields(priced), coverage }, { model, quality: 'partial' });
     calculated = { ...result, quality: result.calculation_quality ?? 'unavailable',
-      ...(priced ? { unpriced_components: [...(result.unpriced_components ?? []), 'auto_review_tokens'] } : {}) };
+      ...(priced ? { unpriced_components: [...(result.unpriced_components ?? []), ...unpriced.components] } : {}) };
   } else if (authMode !== 'subscription' && authMode !== 'unknown') {
     const apiRates = input?.api_rates && typeof input.api_rates === 'object' ? input.api_rates : null;
     if (apiRates) {
@@ -1485,7 +1490,7 @@ function workflowAdvisorMessage(state, advisor) {
   return notice.text;
 }
 
-function attachScopeChildren(state, input, turn, runtime = 'codex') {
+function attachScopeChildren(state, input, turn, runtime = 'codex', accounted = undefined) {
   const generation = sessionGeneration(state, input, runtime);
   const targetScopeId = scopeIdentity(runtime, input.session_id, input.turn_id, generation);
   const scope = targetScopeId ? state.scopes[targetScopeId] : undefined;
@@ -1531,12 +1536,13 @@ function attachScopeChildren(state, input, turn, runtime = 'codex') {
   }
   turn.overflow_count = Math.max(turn.overflow_count ?? 0, target.overflow_count ?? 0);
   // A child started in this session since its last main Stop, from another
-  // scope, did unjoined work: this receipt reads partial. Links stored before
-  // beta 137 carry no flag and count nowhere.
+  // scope, did unjoined work: this receipt reads partial, unless the Stop read
+  // that agent's rollout (`accounted`: counted, or already an unavailable
+  // source). Links stored before beta 137 carry no flag and count nowhere.
   for (const link of Object.values(state.agent_scopes)) {
     if (link.awaiting_parent_stop !== true || link.session !== sessionHash
       || (Number.isSafeInteger(link.session_generation) ? link.session_generation : 0) !== generation) continue;
-    if (link.source_scope !== targetScopeId) turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, turn.overflow_count + 1);
+    if (link.source_scope !== targetScopeId && !accounted?.has(link.lifecycle_agent_id)) turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, turn.overflow_count + 1);
     delete link.awaiting_parent_stop;
   }
   if (openAgents.length > 0) {
@@ -1672,7 +1678,7 @@ function reconcilePendingReceipt(state, turn, receipt, input, runtime, structure
   const ambiguous = main.ambiguous || subagents.some((entry) => entry.ambiguous) || turn.overflow_count > 0 || summed.consistent === false;
   const status = classifyReceipt({ main, subagents, ambiguous });
   const model = safeModel(input.model) ?? turn.main?.metadata?.model;
-  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: reviewUsage(turn) });
+  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: unpricedUsage(turn) });
   const planComparison = planComparisonForReceipt(state, runtime, status, summed);
   const expectedSources = 1 + Object.keys(turn.subagents).length + (turn.overflow_count ?? 0);
   const resolvedSources = 1 + subagents.filter((entry) => entry.valid).length;
@@ -1844,21 +1850,43 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   const mainSnapshot = !snapshot.unreadable && snapshot.parsed?.latest
     ? snapshot
     : stagedSnapshot ?? snapshot;
-  attachScopeChildren(state, input, turn, runtime);
-  // Codex fires no subagent hook for an auto-review. Read before updateThread commits the thread:
-  // a review of this turn changed its rollout after that commit. Structured Stop usage (never seen on
-  // the maintainer's Mac) might already hold the reviews, so that path is left as it was.
+  // Codex fires no subagent hook for an auto-review, and runs a spawned agent's SubagentStart in that
+  // agent's own turn. Read their rollouts before updateThread commits the thread: work for this turn
+  // changed them after that commit. Structured Stop usage (never seen on the maintainer's Mac) might
+  // already hold this usage, so that path is left as it was.
   // Only the collector's own persistent opt-in ($CODEX_HOME or ~/.codex) allows this read, never an
   // installation-local copy, so a revocation always reaches it.
   const { CODEX_HOME: codexHome } = codexConsentEnvironment(env);
   const reviewRoot = runtime === 'codex' && !preferredStructured && codexHome ? configuredCodexLedgerRoot({ CODEX_HOME: codexHome }) : null;
-  const reviews = reviewRoot ? codexReviewUsage({ root: reviewRoot, transcriptPath: input.transcript_path,
+  const children = reviewRoot ? codexChildUsage({ root: reviewRoot, transcriptPath: input.transcript_path,
     sessionId: input.session_id, turnId: input.turn_id, since: state.threads[mainKey]?.updated_at }) : null;
-  if (reviews?.usage) {
-    const key = hashId(`codex:auto-review:${turnHash}`);
-    turn.subagents[key] ??= { agent_id: key, status: 'completed', usage: tokenFields(reviews.usage), auto_review: true, updated_at: timestamp() };
+  // A spawned agent counts under its lifecycle identity (SubagentStart's agent_id is the agent's thread
+  // id). An agent whose link joined this turn's scope brings its usage through that link instead.
+  const agentScope = scopeIdentity(runtime, input.session_id, input.turn_id, generation);
+  const joined = new Set(Object.values(state.agent_scopes).filter((link) => agentScope && link.source_scope === agentScope).map((link) => link.lifecycle_agent_id));
+  const counted = [], unresolved = [];
+  for (const agent of children?.agents.counted ?? []) {
+    const id = lifecycleAgentIdentity(runtime, input.session_id, agent.thread);
+    if (!id) unresolved.push(null);
+    else if (!joined.has(id)) counted.push({ id, usage: agent.usage });
   }
-  if (reviews?.unknown) turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, (turn.overflow_count ?? 0) + 1);
+  for (const thread of children?.agents.unresolved ?? []) {
+    const id = lifecycleAgentIdentity(runtime, input.session_id, thread);
+    if (!id || !joined.has(id)) unresolved.push(id);
+  }
+  // A start is accounted for once its agent has usage for this turn or is an unavailable source here.
+  attachScopeChildren(state, input, turn, runtime, children ? new Set([...counted.filter((agent) => agent.usage).map((agent) => agent.id), ...unresolved]) : undefined);
+  if (children?.usage) {
+    const key = hashId(`codex:auto-review:${turnHash}`);
+    turn.subagents[key] ??= { agent_id: key, status: 'completed', usage: tokenFields(children.usage), auto_review: true, updated_at: timestamp() };
+  }
+  for (const agent of counted) {
+    if (!agent.usage) continue;
+    const key = hashId(`codex:spawned-agent:${turnHash}:${agent.id}`);
+    turn.subagents[key] ??= { agent_id: key, status: 'completed', usage: tokenFields(agent.usage), spawned_agent: true, updated_at: timestamp() };
+  }
+  // Each spawned agent whose usage for this turn may be incomplete is one unavailable source.
+  turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, (turn.overflow_count ?? 0) + (children?.unknown ? 1 : 0) + unresolved.length);
 
   const main = preferredStructured?{valid:false,ambiguous:false,metadata:hookMetadata(input,'main')}:mainKey && mainSourceId
     ? updateThread(state, mainKey, input.transcript_path, mainSourceId, mainSnapshot, { runtime, session_id: input.session_id, turn_id:input.turn_id,
@@ -1911,7 +1939,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   const metadataConfidence = aggregateMetadataConfidence(turn);
   const ponytail = aggregatePonytail(turn);
   const model = safeModel(input.model) ?? turn.main?.metadata?.model;
-  const builtUsage = status === 'unavailable' ? { usageLayers: null, coverage: 'unavailable', authMode: runtime === 'claude' ? detectClaudeAuthMode(input, env) : 'codex' } : buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: reviewUsage(turn) });
+  const builtUsage = status === 'unavailable' ? { usageLayers: null, coverage: 'unavailable', authMode: runtime === 'claude' ? detectClaudeAuthMode(input, env) : 'codex' } : buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: unpricedUsage(turn) });
   const { usageLayers, coverage, authMode } = builtUsage;
   const planComparison = planComparisonForReceipt(state, runtime, status, summed);
   const receiptTokenFields = status === 'unavailable' ? {} : tokenFields(summed);
@@ -2342,7 +2370,7 @@ function refreshClosedParentReceipt(state, parentTurn, receipt, input, runtime, 
   const resolvedSources = 1 + subagents.filter((child) => child.valid).length;
   const unavailableSources = Math.max(0, expectedSources - resolvedSources);
   const model = receipt.metadata?.model ?? parentTurn.main.metadata?.model;
-  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: reviewUsage(parentTurn) });
+  const builtUsage = buildReceiptUsageLayers({ runtime, status, summed, model, input, env, unpriced: unpricedUsage(parentTurn) });
   const planComparison = planComparisonForReceipt(state, runtime, status, summed);
   const efficiency = { ...(receipt.efficiency ?? {}) };
   delete efficiency.affected_exact_tokens;

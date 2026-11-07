@@ -732,8 +732,9 @@ export function recoverState(value, options = {}) {
         ...(childTurn ? { child_turn: childTurn } : {}),
         ...(sourceId ? { source_id: sourceId } : {}),
         ...(SAFE_REASONS.has(agent.reason) ? { reason: agent.reason } : {}),
-        // A counted Codex auto-review stays unpriced when a later hook rebuilds the receipt.
+        // A counted Codex auto-review or spawned agent stays unpriced when a later hook rebuilds the receipt.
         ...(agent.auto_review === true ? { auto_review: true } : {}),
+        ...(agent.spawned_agent === true ? { spawned_agent: true } : {}),
         session_generation: persistedGeneration(agent.session_generation),
         updated_at: persistedTime(agent.updated_at),
       };

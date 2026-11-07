@@ -1,6 +1,6 @@
 {
   "name": "somestoken",
-  "version": "0.6.0-beta.143+codex.20261106145656",
+  "version": "0.6.0-beta.144+codex.20261107201944",
   "description": "Local task, model and token tracking, opt-in efficiency guidance, and evidence-gated comparisons for Codex and Claude Code.",
   "author": {
     "name": "Somestr"

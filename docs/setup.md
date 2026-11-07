@@ -66,7 +66,7 @@ node plugins/somestoken/bin/report.mjs --enable-codex-ledger="$HOME/.codex/sessi
 node plugins/somestoken/bin/report.mjs --enable-claude-feed                          # Claude Code
 ```
 
-- **Codex:** the collector reads Codex's saved sessions, and SomesToken's Stop hook reads the auto-review sessions saved during each turn to add their usage to the turn receipt. Use your `$CODEX_HOME/sessions` if you set `CODEX_HOME`.
+- **Codex:** the collector reads Codex's saved sessions, and SomesToken's Stop hook reads the auto-review and spawned-agent sessions saved during each turn to add their usage to the turn receipt. Use your `$CODEX_HOME/sessions` if you set `CODEX_HOME`.
 - **Claude Code:** SomesToken's hooks and the collector read usage numbers from Claude Code's transcripts in `~/.claude/projects` (`$CLAUDE_CONFIG_DIR/projects` if you set it). The numbers go to `~/.codex/somestoken/claude-feed`, capped at 64 MiB.
 
 Both choices are stored in `~/.codex/somestoken/ledger-config.json` and survive updates. Revoke them with `--disable-codex-ledger` and `--disable-claude-feed`.
