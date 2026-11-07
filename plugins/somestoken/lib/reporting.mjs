@@ -148,6 +148,9 @@ export const HEALTH_KEYS = Object.freeze([
   'limit_recovery_unavailable',
   'limit_recovery_protocol_errors',
   'limit_recovery_state_drops',
+  'claude_stop_final_waits',
+  'claude_stop_final_timeouts',
+  'stop_continuations',
 ]);
 
 const MAX_REPORT_ITEMS = 100;
@@ -1536,6 +1539,7 @@ export function publicAdvisorReport(value, options = {}) {
 
 const DEGRADED_HEALTH_KEYS = new Set([
   'malformed_events',
+  'claude_stop_final_timeouts',
   'duplicate_hooks',
   'duplicate_events',
   'counter_resets',

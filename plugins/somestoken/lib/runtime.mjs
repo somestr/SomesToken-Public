@@ -232,6 +232,44 @@ export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
   }
 }
 
+// Claude can fire Stop before it writes the turn's last response: on 2026-11-05 a receipt left out that
+// response (287,121 tokens) and still read exact. A finished turn ends with an answer that asked for no
+// tool; a tail that ends with a tool request or its result still awaits one. Meta lines are context for
+// the model, not answers. Returns true or false, or null when the tail cannot tell (unreadable, or no
+// conversational line in its last MAX_TAIL_BYTES). Only types and stop reasons are read.
+function claudeTranscriptAwaitsResponse(filePath) {
+  const tail = readTranscriptTail(filePath);
+  if (tail.unreadable) return null;
+  const lines = tail.text.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    let entry;
+    try { entry = JSON.parse(lines[index]); } catch { continue; }
+    if (entry?.isSidechain === true || (entry?.type === 'user' && entry.isMeta === true)) continue;
+    if (entry?.type === 'assistant') return entry.message?.stop_reason === 'tool_use';
+    if (entry?.type === 'user') {
+      const content = entry.message?.content;
+      return Array.isArray(content) && content.length > 0 && content.every((block) => block?.type === 'tool_result');
+    }
+  }
+  return null;
+}
+
+// Claude writes that response while its Stop hooks run: on 2026-11-05 it reached the file after the hook's
+// read and before Claude logged the hooks' summary, 0.15 s after the receipt. A Claude Stop waits for it
+// before taking the state lock, at most CLAUDE_FINAL_WAIT_MS of the hook's 10 s; a Stop that still finds
+// no answer reads partial.
+// ponytail: a last line over 1 MiB (48 of 14,685 tool results since 2026-11-01, at most 2.1 MiB) reads
+// null, so that Stop does not wait; read the line's head if such Stops lose responses.
+const CLAUDE_FINAL_WAIT_MS = 2000, CLAUDE_FINAL_POLL_MS = 50;
+async function awaitClaudeFinalResponse(filePath) {
+  if (typeof filePath !== 'string' || filePath.length === 0 || claudeTranscriptAwaitsResponse(filePath) !== true) return null;
+  for (const deadline = Date.now() + CLAUDE_FINAL_WAIT_MS; Date.now() < deadline;) {
+    await new Promise((resolve) => setTimeout(resolve, CLAUDE_FINAL_POLL_MS));
+    if (claudeTranscriptAwaitsResponse(filePath) !== true) return 'waited';
+  }
+  return 'timed_out';
+}
+
 // A Codex turn longer than the tail keeps its total there but not its first records (turns of 8.6 MB on
 // 2026-11-04, 204 MiB on 2026-10-31). codexTurnRecords reads the rollout backward in chunks and keeps
 // only the lines that can be usage records, down to the line that started the turn, the start of the
@@ -1810,7 +1848,42 @@ function refreshActiveStopEfficiency(receipt, efficiency) {
   return { ...updated, warning_emitted: true };
 }
 
-function responseForStop(state, input, runtime = 'codex', efficiency = null, env = process.env, thresholdWarnings = []) {
+// Another hook can block a Stop; the host then continues the same turn and sends its next Stop with
+// stop_hook_active (Codex: codex-rs/core/src/session/turn.rs). Two Codex receipts (2026-10-30, 11-01) kept
+// only the part before the block and read exact. The continuation folds into the one receipt: Codex's own
+// records give the whole turn, a transcript delta what the turn gained since. Auto-reviews and spawned
+// agents are read at the first Stop; when their rollouts changed since, some may belong to the
+// continuation, and the receipt reads partial.
+function foldContinuedStop(state, input, runtime, env, turn, receipt, { mainKey, mainSourceId, snapshot, preferredStructured, finalWait }) {
+  incrementHealth(state, 'stop_continuations');
+  const { CODEX_HOME: codexHome } = codexConsentEnvironment(env);
+  const reviewRoot = runtime === 'codex' && !preferredStructured && codexHome ? configuredCodexLedgerRoot({ CODEX_HOME: codexHome }) : null;
+  const children = reviewRoot ? codexChildUsage({ root: reviewRoot, transcriptPath: input.transcript_path,
+    sessionId: input.session_id, turnId: input.turn_id, since: state.threads[mainKey]?.updated_at }) : null;
+  if (children && (children.usage || children.unknown || children.agents.unresolved.length || children.agents.counted.some((agent) => agent.usage))) {
+    turn.overflow_count = Math.min(MAX_AGENTS_PER_TURN, (turn.overflow_count ?? 0) + 1);
+  }
+  // An agent started since the first Stop did work this receipt does not join; settle its start here, not in
+  // the next turn. A Stop without a turn id (Claude) would count its still-running agents a second time.
+  if (input.turn_id) attachScopeChildren(state, input, turn, runtime);
+  let usage = null, ambiguous = true;
+  if (preferredStructured) [usage, ambiguous] = [preferredStructured, false];
+  else if (mainKey && mainSourceId) {
+    const main = updateThread(state, mainKey, input.transcript_path, mainSourceId, snapshot, { runtime, session_id: input.session_id, turn_id: input.turn_id });
+    if (main.valid) {
+      usage = main.usage_source === 'codex_structured_ledger' ? main.delta : sumUsage([turn.main.usage, main.delta]);
+      ambiguous = Boolean(main.ambiguous) || finalWait === 'timed_out';
+    }
+  }
+  // A continuation that cannot be read keeps the first part as a lower bound.
+  turn.main = { ...turn.main, ambiguous: turn.main.ambiguous === true || ambiguous, ...(usage ? { usage: tokenFields(usage) } : {}) };
+  const before = receipt.status;
+  if (refreshClosedParentReceipt(state, turn, receipt, input, runtime, env) === 'partial' && before === 'exact') incrementHealth(state, 'partial_receipts');
+}
+
+function responseForStop(state, input, runtime = 'codex', efficiency = null, env = process.env, thresholdWarnings = [], finalWait = null) {
+  if (finalWait === 'waited') incrementHealth(state, 'claude_stop_final_waits');
+  if (finalWait === 'timed_out') incrementHealth(state, 'claude_stop_final_timeouts');
   const structuredUsage = structuredPostTurnUsage(input, runtime);
   // Complete host counters with an explicit turn/session binding need no
   // transcript reread. Ambiguous/partial deliveries retain the old fallback.
@@ -1830,6 +1903,9 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
     // the completed receipt. Keep one receipt, but surface the first throttled
     // structural warning against that already-accounted turn.
     const receipt = state.receipts.find((entry) => entry?.turn_id === turnHash) ?? turn.receipt;
+    const continued = input?.stop_hook_active === true && turn.main?.valid === true && Boolean(turn.main.usage)
+      && (receipt?.status === 'exact' || receipt?.status === 'partial');
+    if (continued) foldContinuedStop(state, input, runtime, env, turn, receipt, { mainKey, mainSourceId, snapshot, preferredStructured, finalWait });
     const continuedEfficiency = input?.stop_hook_active === true
       ? refreshActiveStopEfficiency(receipt, efficiency)
       : null;
@@ -1838,6 +1914,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
       const systemMessage = warningText(continuedEfficiency, receipt?.usage_layers);
       if (systemMessage) return { systemMessage };
     }
+    if (continued) return {};
     incrementHealth(state, 'duplicate_hooks');
     incrementHealth(state, 'duplicate_events');
     return {};
@@ -1904,7 +1981,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   const mainUsage = main.valid ? main.delta : structuredMain;
   const mainValid = main.valid || Boolean(structuredMain);
   const mainAmbiguous = main.valid
-    ? main.ambiguous || mainSnapshot.staged_final_message === true
+    ? main.ambiguous || mainSnapshot.staged_final_message === true || finalWait === 'timed_out'
     : structuredMain?.quality === 'partial';
   const mainMetadata = mergeRuntimeMetadata(hookMetadata(input, 'main'), main.metadata, turn.main?.metadata);
   turn.main = {
@@ -2714,6 +2791,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
     recordLockTimeout(stateDir, runtime);
     return {};
   }
+  const finalWait = runtime === 'claude' && name === 'Stop' ? await awaitClaudeFinalResponse(input?.transcript_path) : null;
   try {
     return await withLock(stateDir, async () => {
       const state = loadState(stateDir, runtime, { preserveLimitRecovery: name === 'SessionEnd' });
@@ -2776,7 +2854,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
         if (reconciliation.reconciled === true && stagedTurn) delete state.claude_final_snapshots?.[stagedTurn];
         publishPublicBridge = reconciliation.reconciled === true;
       }
-      else if (name === 'Stop' && !efficiency?.late_event) response = responseForStop(state, input ?? {}, runtime, efficiency, hookEnv, thresholdWarnings);
+      else if (name === 'Stop' && !efficiency?.late_event) response = responseForStop(state, input ?? {}, runtime, efficiency, hookEnv, thresholdWarnings, finalWait);
       else if (name === 'StopFailure' && !efficiency?.late_event) response = responseForStopFailure(state, input ?? {}, runtime, efficiency);
       else response = {};
       if (name === 'SessionEnd' && !efficiency?.ignored_session_end && !efficiency?.missing_session_identity) {

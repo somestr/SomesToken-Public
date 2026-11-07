@@ -74,7 +74,7 @@ export function codexChildUsage({ root, transcriptPath, sessionId, turnId, since
       try { stat = fs.lstatSync(file); } catch { continue; }
       if (!stat.isFile() || stat.mtimeMs < start - MTIME_SLACK_MS) continue;
       // ponytail: a compressed rollout changed in the window is not read; decompress with zstdChunks
-      // if Codex compresses fresh rollouts again (it stopped on 2026-10-26 on the maintainer's Mac).
+      // if Codex compresses fresh rollouts again (it stopped on 2026-10-30 on the maintainer's Mac).
       // While both copies exist the plain one is read, as the collector does.
       if (compressed) { if (!names.includes(name.slice(0, -4))) unknown = true; continue; }
       candidates.push(file);
