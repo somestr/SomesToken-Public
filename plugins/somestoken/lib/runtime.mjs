@@ -234,25 +234,38 @@ export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
 
 // Claude can fire Stop before it writes the turn's last response: on 2026-11-05 a receipt left out that
 // response (287,121 tokens) and still read exact. A finished turn ends with an answer that asked for no
-// tool. A tail that ends with a tool request, or with input the model has not answered (any user line: the
-// prompt, a tool result, a Stop hook's feedback; or a Stop hook's added context, which Claude Code 2.1.319
-// also answers in the same turn), still awaits one. Returns true or false, or null when the tail cannot tell
-// (unreadable, or no conversational line in its last MAX_TAIL_BYTES). Only types, stop reasons and hook
-// event names are read.
+// tool. A tail that ends with a tool request, or with input the model has not answered, still awaits one:
+// any user line (a typed prompt, a meta line that started the turn, a tool result), or what an earlier Stop
+// of the same turn left (a hook's block, written as a meta user line labelled "Stop hook feedback:", or a
+// hook's added context, which Claude Code 2.1.319 also answers in the same turn). Claude Code writes each
+// Stop hook's result as soon as that hook returns, and the Stop's stop_hook_summary only after all of its
+// hooks, this one included, have returned. So feedback or added context that no summary follows came from
+// this Stop's own hooks and awaits nothing yet: under 146, which waited for it, a Stop that another hook
+// blocked or gave context waited the full 2 s and read partial. Returns true or false, or null when the tail
+// cannot tell (unreadable, or no conversational line in its last MAX_TAIL_BYTES). Only line types and
+// subtypes, the meta flag, whether a meta line starts with that label, stop reasons and hook event names
+// are read.
 // ponytail: of 2,381 Stops on the maintainer's Mac, the only user lines written between the final answer and
 // the hooks' summary were 3 next prompts created after the hooks returned. A Stop that does find one there
-// waits CLAUDE_FINAL_WAIT_MS and reads partial.
+// waits CLAUDE_FINAL_WAIT_MS and reads partial. A continued Stop that reads the tail before the earlier
+// Stop's summary is on disk (so its answer is not either) does not wait, as before 146; that needs a model
+// answer within a few hundred ms of the summary. Subagent Stops leave no summary in the main transcript (all
+// 2,392 summaries in 313 transcripts follow a main Stop's hooks).
 function claudeTranscriptAwaitsResponse(filePath) {
   const tail = readTranscriptTail(filePath);
   if (tail.unreadable) return null;
   const lines = tail.text.split('\n');
+  let summarized = false;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     let entry;
     try { entry = JSON.parse(lines[index]); } catch { continue; }
     if (entry?.isSidechain === true) continue;
+    if (entry?.type === 'system' && entry.subtype === 'stop_hook_summary') { summarized = true; continue; }
     if (entry?.type === 'assistant') return entry.message?.stop_reason === 'tool_use';
-    if (entry?.type === 'user' || (entry?.type === 'attachment' && entry.attachment?.type === 'hook_additional_context'
-      && entry.attachment.hookEvent === 'Stop')) return true;
+    const content = entry?.message?.content;
+    const stopHookOutput = (entry?.type === 'user' && entry.isMeta === true && typeof content === 'string' && content.startsWith('Stop hook feedback:'))
+      || (entry?.type === 'attachment' && entry.attachment?.type === 'hook_additional_context' && entry.attachment.hookEvent === 'Stop');
+    if (stopHookOutput ? summarized : entry?.type === 'user') return true;
   }
   return null;
 }
