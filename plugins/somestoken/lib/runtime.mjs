@@ -234,9 +234,14 @@ export function readTranscriptTail(filePath, maxBytes = MAX_TAIL_BYTES) {
 
 // Claude can fire Stop before it writes the turn's last response: on 2026-11-05 a receipt left out that
 // response (287,121 tokens) and still read exact. A finished turn ends with an answer that asked for no
-// tool; a tail that ends with a tool request or its result still awaits one. Meta lines are context for
-// the model, not answers. Returns true or false, or null when the tail cannot tell (unreadable, or no
-// conversational line in its last MAX_TAIL_BYTES). Only types and stop reasons are read.
+// tool. A tail that ends with a tool request, or with input the model has not answered (any user line: the
+// prompt, a tool result, a Stop hook's feedback; or a Stop hook's added context, which Claude Code 2.1.319
+// also answers in the same turn), still awaits one. Returns true or false, or null when the tail cannot tell
+// (unreadable, or no conversational line in its last MAX_TAIL_BYTES). Only types, stop reasons and hook
+// event names are read.
+// ponytail: of 2,381 Stops on the maintainer's Mac, the only user lines written between the final answer and
+// the hooks' summary were 3 next prompts created after the hooks returned. A Stop that does find one there
+// waits CLAUDE_FINAL_WAIT_MS and reads partial.
 function claudeTranscriptAwaitsResponse(filePath) {
   const tail = readTranscriptTail(filePath);
   if (tail.unreadable) return null;
@@ -244,12 +249,10 @@ function claudeTranscriptAwaitsResponse(filePath) {
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     let entry;
     try { entry = JSON.parse(lines[index]); } catch { continue; }
-    if (entry?.isSidechain === true || (entry?.type === 'user' && entry.isMeta === true)) continue;
+    if (entry?.isSidechain === true) continue;
     if (entry?.type === 'assistant') return entry.message?.stop_reason === 'tool_use';
-    if (entry?.type === 'user') {
-      const content = entry.message?.content;
-      return Array.isArray(content) && content.length > 0 && content.every((block) => block?.type === 'tool_result');
-    }
+    if (entry?.type === 'user' || (entry?.type === 'attachment' && entry.attachment?.type === 'hook_additional_context'
+      && entry.attachment.hookEvent === 'Stop')) return true;
   }
   return null;
 }
