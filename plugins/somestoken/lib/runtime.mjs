@@ -270,6 +270,30 @@ function claudeTranscriptAwaitsResponse(filePath) {
   return null;
 }
 
+// Claude Code runs no UserPromptSubmit hook for some inputs that still start a model turn: bash mode (its 2.1.319
+// bundle lists bash mode among inputs that skip prompt submit, and all 13 bash inputs in 313 transcripts on the
+// maintainer's Mac were answered). That turn's Stop gets the prompt ordinal of the turn before, whose receipt
+// exists, and was counted as a duplicate: the turn had no receipt and the next receipt took its tokens. A
+// main-thread stop_hook_summary newer than that receipt shows that the receipt's Stop has finished (the summary is
+// written after all of a Stop's hooks return), so this Stop ends a later turn; a repeated delivery of the same Stop
+// finds none. Returns that summary's uuid, which keys the later turn, or null.
+// ponytail: a continued Stop of such a turn still folds into the earlier prompt's receipt (no Claude Stop was ever
+// blocked on the maintainer's Mac), and a turn whose lines after the earlier summary exceed MAX_TAIL_BYTES is still
+// counted as a duplicate.
+function claudeStopSince(filePath, since) {
+  const tail = readTranscriptTail(filePath);
+  if (tail.unreadable) return null;
+  const lines = tail.text.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!lines[index].includes('"stop_hook_summary"')) continue;
+    let entry;
+    try { entry = JSON.parse(lines[index]); } catch { continue; }
+    if (entry?.type !== 'system' || entry.subtype !== 'stop_hook_summary' || entry.isSidechain === true) continue;
+    return Date.parse(entry.timestamp) > since ? entry.uuid ?? entry.timestamp : null;
+  }
+  return null;
+}
+
 // Claude writes that response while its Stop hooks run: on 2026-11-05 it reached the file after the hook's
 // read and before Claude logged the hooks' summary, 0.15 s after the receipt. A Claude Stop waits for it
 // before taking the state lock, at most CLAUDE_FINAL_WAIT_MS of the hook's 10 s; a Stop that still finds
@@ -462,6 +486,14 @@ function stopTurnIdentity(state, input, snapshot, runtime) {
     return turnIdentity(runtime, input?.session_id, `claude:${snapshotCount(snapshot?.parsed)}`, generation, 'main', mainSourceId);
   }
   return turnIdentity(runtime, input?.session_id, `codex:${snapshotCount(snapshot?.parsed)}`, generation, 'main', mainSourceId);
+}
+
+// A Claude Stop or StopFailure of a turn that started without UserPromptSubmit (see claudeStopSince) keys its turn
+// by the earlier Stop it follows.
+function laterClaudeTurn(state, input, turnHash, runtime) {
+  const receipt = state.turns[turnHash]?.receipt;
+  const after = runtime === 'claude' && receipt && input?.stop_hook_active !== true ? claudeStopSince(input.transcript_path, receipt.created_at) : null;
+  return after ? hashId(`${turnHash}:after:${after}`) : turnHash;
 }
 
 function claudePromptSnapshotIdentity(state, input, generation, session) {
@@ -1788,7 +1820,7 @@ function stopFailureCategory(input) {
 function responseForStopFailure(state, input, runtime = 'codex', efficiency = null) {
   const mainKey = threadIdentity('main', sourceIdentity(runtime, input.session_id, 'main', sessionGeneration(state, input, runtime)));
   const snapshot = readSnapshots(input.transcript_path, runtime, state.threads[mainKey]?.checkpoint);
-  const turnHash = stopTurnIdentity(state, input, snapshot, runtime);
+  const turnHash = laterClaudeTurn(state, input, stopTurnIdentity(state, input, snapshot, runtime), runtime);
   const turn = ensureTurn(state, turnHash);
   if (turn.receipt) {
     incrementHealth(state, 'duplicate_hooks');
@@ -1908,7 +1940,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   const mainSourceId = sourceIdentity(runtime, input.session_id, 'main', generation);
   const mainKey = threadIdentity('main', mainSourceId);
   const snapshot = preferredStructured?{unreadable:true,truncated:false,parsed:parseTokenSnapshots('')}:readSnapshots(input.transcript_path, runtime, state.threads[mainKey]?.checkpoint);
-  const turnHash = stopTurnIdentity(state, input, snapshot, runtime);
+  const turnHash = laterClaudeTurn(state, input, stopTurnIdentity(state, input, snapshot, runtime), runtime);
   const turn = ensureTurn(state, turnHash);
   if (turn.receipt) {
     if (structuredUsage && turn.receipt.telemetry_reconciliation?.state === 'pending_post_turn') {
