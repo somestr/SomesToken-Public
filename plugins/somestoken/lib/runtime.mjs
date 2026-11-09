@@ -9,6 +9,7 @@ import { configuredClaudeWorkspaceRoot } from './claude-workspace.mjs';
 import { prefixCheck, prefixDigest, TRANSCRIPT_CEILING_BYTES } from './claude-capture.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { releaseFileLock } from './monitor-lock.mjs';
 import { SCHEMA_VERSION, classifyReceipt, deltaUsage, formatReceipt, humanLabel, hashId, hashOpaqueHostIdentifier, mergeRuntimeMetadata, parseTokenSnapshots, PONYTAIL_UNKNOWN_REASON, safeModel, safeReceiptMetadataSummary, sanitizeMetadata, safeOpaqueHostIdentifier, sumUsage, USAGE_KEYS } from './core.mjs';
 import { advisorReport } from './reporting.mjs';
@@ -2795,13 +2796,28 @@ function saveHotContext(stateDir, state, runtime) {
   }
 }
 
+// A hook that timed out on the state lock counts itself only if it can take the lock right away. While the lock
+// stays busy it leaves a marker instead, which the next hook holding the lock counts and removes. Before this, a
+// single retry dropped the count: on 2026-11-09 a Claude Stop lost the lock under machine load, stored nothing, and
+// lock_timeouts did not move.
+// ponytail: at most MAX_MISSED_LOCKS markers wait; a timeout while that many wait is not counted.
+const MISSED_LOCK = /^missed-lock-[0-9a-f-]{36}$/, MAX_MISSED_LOCKS = 1000;
+function missedLocks(stateDir) {
+  try { return fs.readdirSync(stateDir).filter((name) => MISSED_LOCK.test(name)); } catch { return []; }
+}
+
 function recordLockTimeout(stateDir, runtime = 'unknown') {
   const lock = path.join(stateDir, LOCK_FILE);
   let held;
   try {
     ensureStateDirectory(stateDir);
     held = tryFileLock(lock);
-    if (!held) return;
+    if (!held) {
+      if (missedLocks(stateDir).length < MAX_MISSED_LOCKS) {
+        fs.writeFileSync(path.join(stateDir, `missed-lock-${randomUUID()}`), '', { flag: 'wx', mode: 0o600 });
+      }
+      return;
+    }
     const state = loadState(stateDir, runtime);
     incrementHealth(state, 'lock_timeouts');
     saveState(stateDir, state);
@@ -2843,6 +2859,8 @@ export async function handleHook(input, eventName, env = process.env, deferred =
   try {
     return await withLock(stateDir, async () => {
       const state = loadState(stateDir, runtime, { preserveLimitRecovery: name === 'SessionEnd' });
+      const missed = missedLocks(stateDir);
+      incrementHealth(state, 'lock_timeouts', missed.length);
       const deferredHotEvents = drainDeferredHotEvents(stateDir, state, runtime);
       const advisorRetention = expireAdvisorState(state.advisor, timestamp());
       if (advisorRetention.dropped > 0) {
@@ -2965,6 +2983,8 @@ export async function handleHook(input, eventName, env = process.env, deferred =
       saveState(stateDir, state, { durable: durableState });
       if (deferredHotEvents.should_reset) resetHotEvents(stateDir, deferredHotEvents.epoch);
       saveHotContext(stateDir, state, runtime);
+      // Counted and saved above; a marker that cannot be removed is counted again by a later hook.
+      for (const marker of missed) try { fs.rmSync(path.join(stateDir, marker), { force: true }); } catch { /* see above */ }
       return response;
     });
   } catch (error) {
