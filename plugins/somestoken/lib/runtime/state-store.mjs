@@ -4,7 +4,7 @@ import { unlinkOwnedFile } from '../host-paths.mjs';
 // recoverState so its interface stays the same.
 import fs from 'node:fs';
 import path from 'node:path';
-import { SCHEMA_VERSION, isValidUsage, hashId, PONYTAIL_UNKNOWN_REASON, METADATA_CONFIDENCE, METADATA_SOURCES, METADATA_STATUSES, safeModel, isSensitiveRuntimeValue, sanitizeMetadata, USAGE_KEYS } from '../core.mjs';
+import { SCHEMA_VERSION, deltaUsage, isValidUsage, hashId, PONYTAIL_UNKNOWN_REASON, METADATA_CONFIDENCE, METADATA_SOURCES, METADATA_STATUSES, safeModel, isSensitiveRuntimeValue, sanitizeMetadata, USAGE_KEYS } from '../core.mjs';
 import { HEALTH_KEYS } from '../reporting.mjs';
 import { normalizeSavings } from '../savings.mjs';
 import { recoverLegacyClaudeCacheReadUsage } from '../hosts/claude-code.mjs';
@@ -68,7 +68,7 @@ export const MAX_EFFICIENCY_WARNINGS = 100;
 
 export const RECOVERED_STATE = Symbol('somestoken-state-recovered');
 
-const SAFE_REASONS = new Set(['transcript-unavailable', 'unsupported-transcript', 'counter-reset', 'bounded-tail-without-baseline', 'identity-rebaseline', 'checkpoint-rebaseline', 'inconsistent-total', 'source-mismatch', 'stop_failure']);
+const SAFE_REASONS = new Set(['transcript-unavailable', 'unsupported-transcript', 'counter-reset', 'bounded-tail-without-baseline', 'identity-rebaseline', 'checkpoint-rebaseline', 'inconsistent-total', 'source-mismatch', 'display-turn-mismatch', 'stop_failure']);
 
 const TELEMETRY_STATES = new Set(['received', 'pending_post_turn', 'unavailable']);
 
@@ -278,35 +278,59 @@ export function persistedUsage(value, runtime = 'unknown') {
   return usage;
 }
 
-function boundedClaudeFinalSnapshots(value, now = timestamp()) {
+// When a contested display is discarded, its observed interval still predates the next turn.
+function advanceDiscardedClaudeStage(threads, stage) {
+  const observed = stage?.conflicting_stop_usage;
+  if (!observed || stage.accounting_basis !== CLAUDE_ACCOUNTING_BASIS) return;
+  const key = `main:${stage.source_id}`;
+  const prior = threads[key];
+  if (prior && (prior.accounting_basis !== CLAUDE_ACCOUNTING_BASIS || !deltaUsage(prior.usage, observed)?.consistent)) return;
+  if (!prior && Object.keys(threads).length >= MAX_THREADS) return;
+  const thread = prior ?? { schema_version: SCHEMA_VERSION, thread_id: key, source_id: stage.source_id, accounting_basis: CLAUDE_ACCOUNTING_BASIS };
+  thread.usage = observed;
+  thread.compaction_count = Math.max(thread.compaction_count ?? 0, stage.compaction_count);
+  thread.updated_at = Math.max(thread.updated_at ?? 0, stage.staged_at);
+  delete thread.resume_baseline;
+  threads[key] = thread;
+}
+
+export function discardClaudeFinalSnapshot(state, key) {
+  const stage = state.claude_final_snapshots?.[key];
+  if (!stage) return;
+  advanceDiscardedClaudeStage(state.threads, stage);
+  delete state.claude_final_snapshots[key];
+}
+
+function boundedClaudeFinalSnapshots(value, threads, now = timestamp()) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const candidates = [];
-  for (const [turnId, entry] of boundedEntries(value, MAX_CLAUDE_FINAL_SNAPSHOTS)) {
+  for (const [turnId, entry] of boundedEntries(value, MAX_CLAUDE_FINAL_SNAPSHOTS + 1)) {
     if (!/^[a-f0-9]{20}$/.test(turnId) || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     const session = typeof entry.session === 'string' && /^[a-f0-9]{20}$/.test(entry.session) ? entry.session : null;
     const sourceId = typeof entry.source_id === 'string' && /^[a-f0-9]{20}$/.test(entry.source_id) ? entry.source_id : null;
     const usage = persistedUsage(entry.usage, 'claude');
     const stagedAt = Number.isSafeInteger(entry.staged_at) && entry.staged_at >= 0 ? entry.staged_at : null;
     if (!session || !sourceId || !usage || stagedAt === null) continue;
-    // A clock rollback must not erase a valid in-flight host event. Expiry is
-    // only applied when the local clock has advanced past the bounded TTL.
-    if (now >= stagedAt && now - stagedAt > CLAUDE_FINAL_SNAPSHOT_TTL_MS) continue;
-    candidates.push([turnId, {
+    const observed = persistedUsage(entry.conflicting_stop_usage, 'claude');
+    const stage = {
       session,
       source_id: sourceId,
       session_generation: persistedGeneration(entry.session_generation),
       ...(typeof entry.lifecycle_turn_id === 'string' && /^[a-f0-9]{20}$/.test(entry.lifecycle_turn_id)
         ? { lifecycle_turn_id: entry.lifecycle_turn_id } : {}),
       usage: tokenFields(usage),
+      ...(observed && deltaUsage(usage, observed)?.consistent ? { conflicting_stop_usage: tokenFields(observed) } : {}),
       ...(entry.accounting_basis === CLAUDE_ACCOUNTING_BASIS ? { accounting_basis: entry.accounting_basis } : {}),
       compaction_count: Number.isSafeInteger(entry.compaction_count) && entry.compaction_count >= 0
         ? Math.min(entry.compaction_count, MAX_HEALTH_COUNTER) : 0,
       staged_at: stagedAt,
-    }]);
+    };
+    if (now - stagedAt > CLAUDE_FINAL_SNAPSHOT_TTL_MS) advanceDiscardedClaudeStage(threads, stage);
+    else candidates.push([turnId, stage]);
   }
-  return Object.fromEntries(candidates
-    .sort((a, b) => b[1].staged_at - a[1].staged_at)
-    .slice(0, MAX_CLAUDE_FINAL_SNAPSHOTS));
+  candidates.sort((a, b) => b[1].staged_at - a[1].staged_at);
+  if (candidates.length > MAX_CLAUDE_FINAL_SNAPSHOTS) advanceDiscardedClaudeStage(threads, candidates.pop()[1]);
+  return Object.fromEntries(candidates);
 }
 
 function persistedUsageLayers(value, runtime = 'unknown') {
@@ -623,9 +647,6 @@ export function recoverState(value, options = {}) {
   state.identity_rebaseline = pathDerivedIdentityState
     ? migrationRebaselineFromAdvisor(state.advisor)
     : boundedIdentityRebaseline(value.identity_rebaseline);
-  state.claude_final_snapshots = pathDerivedIdentityState
-    ? {}
-    : boundedClaudeFinalSnapshots(value.claude_final_snapshots);
   if (pathDerivedIdentityState) {
     const dropped = Math.min(MAX_HEALTH_COUNTER,
       Object.keys(value.threads ?? {}).length
@@ -679,6 +700,7 @@ export function recoverState(value, options = {}) {
       updated_at: persistedTime(entry.updated_at),
     };
   }
+  if (!pathDerivedIdentityState) state.claude_final_snapshots = boundedClaudeFinalSnapshots(value.claude_final_snapshots, state.threads);
   let recoveredTurnIndex = 0;
   if (!pathDerivedIdentityState) for (const [key, entry] of boundedEntries(value.turns, MAX_TURNS)) {
     if (!entry || typeof entry !== 'object') continue;
@@ -704,6 +726,7 @@ export function recoverState(value, options = {}) {
           valid: entry.main.valid === true,
           ambiguous: entry.main.ambiguous === true,
           reason: SAFE_REASONS.has(entry.main.reason) ? entry.main.reason : undefined,
+          ...(typeof entry.main.implicit_turn === 'boolean' ? { implicit_turn: entry.main.implicit_turn } : {}),
           ...(usage ? { usage } : {}),
           ...(sourceId ? { source_id: sourceId } : {}),
           model: safeModel(entry.main.model),
@@ -933,7 +956,7 @@ export function tokenFields(usage) {
 function prune(state) {
   const stagedSnapshotInput = state.claude_final_snapshots && typeof state.claude_final_snapshots === 'object'
     ? state.claude_final_snapshots : {};
-  const stagedSnapshots = boundedClaudeFinalSnapshots(stagedSnapshotInput);
+  const stagedSnapshots = boundedClaudeFinalSnapshots(stagedSnapshotInput, state.threads);
   const stagedSnapshotDrops = Math.max(0, Object.keys(stagedSnapshotInput).length - Object.keys(stagedSnapshots).length);
   const stateDrops = Math.max(0, Object.keys(state.threads).length - MAX_THREADS)
     + Math.max(0, Object.keys(state.turns).length - MAX_TURNS)

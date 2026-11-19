@@ -66,6 +66,7 @@ import {
   persistedHotEventState,
   blankIdentityRebaseline,
   persistedUsage,
+  discardClaudeFinalSnapshot,
   boundedAlertMap,
   persistedPonytail,
   recoverState,
@@ -275,12 +276,10 @@ function claudeTranscriptAwaitsResponse(filePath) {
 // bundle lists bash mode among inputs that skip prompt submit, and all 13 bash inputs in 313 transcripts on the
 // maintainer's Mac were answered). That turn's Stop gets the prompt ordinal of the turn before, whose receipt
 // exists, and was counted as a duplicate: the turn had no receipt and the next receipt took its tokens. A
-// main-thread stop_hook_summary newer than that receipt shows that the receipt's Stop has finished (the summary is
-// written after all of a Stop's hooks return), so this Stop ends a later turn; a repeated delivery of the same Stop
-// finds none. Returns that summary's uuid, which keys the later turn, or null.
-// ponytail: a continued Stop of such a turn still folds into the earlier prompt's receipt (no Claude Stop was ever
-// blocked on the maintainer's Mac), and a turn whose lines after the earlier summary exceed MAX_TAIL_BYTES is still
-// counted as a duplicate.
+// main-thread stop_hook_summary newer than that receipt can key a later turn when the hook has no explicit turn ID.
+// Claude writes the summary after the Stop hooks return, so a replay before its own summary uses the same key.
+// Returns the summary's uuid or timestamp, or null.
+// ponytail: a turn whose lines after the earlier summary exceed MAX_TAIL_BYTES is still counted as a duplicate.
 function claudeStopSince(filePath, since) {
   const tail = readTranscriptTail(filePath);
   if (tail.unreadable) return null;
@@ -476,24 +475,30 @@ function sessionTotalsKey(sessionHash, generation = 0) {
   return hashId(`${sessionHash}:generation:${generation}`);
 }
 
+function claudeFallbackTurnId(state, input, snapshot) {
+  const ordinal = claudePromptOrdinal(state, input);
+  return ordinal === null ? `claude:${snapshotCount(snapshot?.parsed)}` : `claude-prompt:${ordinal}`;
+}
+
 function stopTurnIdentity(state, input, snapshot, runtime) {
   const generation = sessionGeneration(state, input, runtime);
   const mainSourceId = sourceIdentity(runtime, input?.session_id, 'main', generation);
   const suppliedTurnId = safeOpaqueHostIdentifier(input?.turn_id);
   if (suppliedTurnId) return turnIdentity(runtime, input?.session_id, suppliedTurnId, generation, 'main', mainSourceId);
-  if (runtime === 'claude') {
-    const promptOrdinal = claudePromptOrdinal(state, input);
-    if (promptOrdinal !== null) return turnIdentity(runtime, input?.session_id, `claude-prompt:${promptOrdinal}`, generation, 'main', mainSourceId);
-    return turnIdentity(runtime, input?.session_id, `claude:${snapshotCount(snapshot?.parsed)}`, generation, 'main', mainSourceId);
-  }
-  return turnIdentity(runtime, input?.session_id, `codex:${snapshotCount(snapshot?.parsed)}`, generation, 'main', mainSourceId);
+  const fallback = runtime === 'claude' ? claudeFallbackTurnId(state, input, snapshot) : `codex:${snapshotCount(snapshot?.parsed)}`;
+  return turnIdentity(runtime, input?.session_id, fallback, generation, 'main', mainSourceId);
 }
 
-// A Claude Stop or StopFailure of a turn that started without UserPromptSubmit (see claudeStopSince) keys its turn
-// by the earlier Stop it follows.
 function laterClaudeTurn(state, input, turnHash, runtime) {
+  if (runtime !== 'claude' || safeOpaqueHostIdentifier(input?.turn_id)) return turnHash;
   const receipt = state.turns[turnHash]?.receipt;
-  const after = runtime === 'claude' && receipt && input?.stop_hook_active !== true ? claudeStopSince(input.transcript_path, receipt.created_at) : null;
+  if (receipt?.session && input?.stop_hook_active === true) {
+    // A prompt-less turn keeps the earlier prompt ordinal; its continuation belongs to the latest receipt.
+    const latest = state.receipts.findLast((entry) => entry.session === receipt.session
+      && (entry.session_generation ?? 0) === (receipt.session_generation ?? 0));
+    return latest && state.turns[latest.turn_id]?.receipt ? latest.turn_id : turnHash;
+  }
+  const after = receipt && input?.stop_hook_active !== true ? claudeStopSince(input.transcript_path, receipt.created_at) : null;
   return after ? hashId(`${turnHash}:after:${after}`) : turnHash;
 }
 
@@ -505,37 +510,35 @@ function claudePromptSnapshotIdentity(state, input, generation, session) {
 }
 
 function stageClaudeFinalSnapshot(state, input) {
-  // Claude includes agent_id for subagent and --agent hook calls. A final
-  // display from either is not safely attributable to the main Stop, so field
-  // presence alone suppresses staging without inspecting or retaining it.
-  if (Object.hasOwn(input ?? {}, 'agent_id')) return null;
   const generation = sessionGeneration(state, input, 'claude');
   const mainKey = threadIdentity('main', sourceIdentity('claude', input?.session_id, 'main', generation));
   const source = readSnapshots(input?.transcript_path, 'claude', state.threads[mainKey]?.checkpoint);
   // A bounded tail without its own baseline cannot identify a complete turn,
   // and a rebased counter is not one either. Waiting for Stop remains safer
   // than turning that partial file view into a counter source.
-  if (source.unreadable || source.truncated || source.rebaseline || !source.parsed?.latest?.usage) return null;
+  if (source.unreadable || source.truncated || source.rebaseline || !source.parsed?.latest?.usage) return;
   const suppliedTurnId = safeOpaqueHostIdentifier(input?.turn_id);
   // A session generation after an explicit reopen can receive delayed command
   // hooks from the prior generation. Prompt ordinals restart in the new
   // generation and cannot prove that a delayed final display belongs to its
   // new Stop. Preserve the first-generation fallback, but require the
   // documented host turn boundary after a reopen.
-  if (generation > 0 && !suppliedTurnId) return null;
+  if (generation > 0 && !suppliedTurnId) return;
   const session = sessionIdentity('claude', input?.session_id);
   const sourceId = sourceIdentity('claude', input?.session_id, 'main', generation);
   const turnId = stopTurnIdentity(state, input, source, 'claude');
   const usage = persistedUsage(source.parsed.latest.usage, 'claude');
-  if (!session || !sourceId || !turnId || !usage) return null;
+  if (!session || !sourceId || !turnId || !usage) return;
   // Stop hooks do not document a turn_id, while MessageDisplay does. A
   // submitted-prompt ordinal is the shared, content-free fallback boundary.
-  // Retain the display turn only as an invalidation marker, never as content.
+  // The hashed display turn also guards against an explicitly different Stop.
   const stageKey = generation === 0
     ? claudePromptSnapshotIdentity(state, input, generation, session) ?? turnId
     : turnId;
   const lifecycleTurn = lifecycleTurnIdentity('claude', input?.session_id, input?.turn_id);
   state.claude_final_snapshots ??= {};
+  // A redelivered display cannot establish ownership of the growth observed by a different Stop.
+  if (state.claude_final_snapshots[stageKey]?.conflicting_stop_usage) return;
   state.claude_final_snapshots[stageKey] = {
     session,
     source_id: sourceId,
@@ -547,7 +550,6 @@ function stageClaudeFinalSnapshot(state, input) {
       ? Math.min(source.parsed.compactions, MAX_HEALTH_COUNTER) : 0,
     staged_at: timestamp(),
   };
-  return stageKey;
 }
 
 function stagedClaudeSnapshotSource(snapshot) {
@@ -566,7 +568,7 @@ function stagedClaudeSnapshotSource(snapshot) {
   };
 }
 
-function takeClaudeFinalSnapshot(state, input, turnId) {
+function claudeStopSnapshot(state, input, turnId, transcript, { previouslyPending = false } = {}) {
   const snapshots = state.claude_final_snapshots;
   const generation = sessionGeneration(state, input, 'claude');
   const session = sessionIdentity('claude', input?.session_id);
@@ -577,59 +579,74 @@ function takeClaudeFinalSnapshot(state, input, turnId) {
   // from the current prompt and must not become a partial receipt.
   if (generation > 0 && !suppliedTurnId) {
     clearClaudeFinalSnapshots(state, session, generation);
-    return null;
+    return transcript;
   }
   const promptKey = generation === 0
     ? claudePromptSnapshotIdentity(state, input, generation, session)
     : null;
-  const keys = [...new Set([turnId, promptKey].filter(Boolean))];
-  for (const key of keys) {
-    const staged = snapshots?.[key];
-    if (!staged || typeof staged !== 'object') continue;
-    delete snapshots[key];
-    const now = timestamp();
-    if (!session || !sourceId
-      || staged.session !== session
-      || staged.source_id !== sourceId
-      || staged.session_generation !== generation
-      || staged.accounting_basis !== CLAUDE_ACCOUNTING_BASIS
-      || !Number.isSafeInteger(staged.staged_at)
-      || (now >= staged.staged_at && now - staged.staged_at > CLAUDE_FINAL_SNAPSHOT_TTL_MS)) continue;
-    const usage = persistedUsage(staged.usage, 'claude');
-    if (usage) return stagedClaudeSnapshotSource({ ...staged, usage: tokenFields(usage) });
+  const lifecycleTurn = lifecycleTurnIdentity('claude', input?.session_id, suppliedTurnId);
+  const now = timestamp();
+  for (const [id, entry] of Object.entries(snapshots ?? {})) {
+    if (entry.source_id === sourceId && now - entry.staged_at > CLAUDE_FINAL_SNAPSHOT_TTL_MS) discardClaudeFinalSnapshot(state, id);
   }
-  return null;
+  const eligible = (entry) => entry && entry.session === session && entry.source_id === sourceId
+    && entry.session_generation === generation && entry.accounting_basis === CLAUDE_ACCOUNTING_BASIS;
+  let key;
+  for (const id of [turnId, promptKey]) {
+    const entry = snapshots?.[id];
+    if (!entry || (lifecycleTurn && entry.lifecycle_turn_id && entry.lifecycle_turn_id !== lifecycleTurn)) continue;
+    if (eligible(entry)) { key = id; break; }
+    delete snapshots[id];
+  }
+  const owner = snapshots?.[key];
+  const current = transcript.unreadable ? null : transcript.parsed?.latest?.usage;
+  const prior = state.threads[threadIdentity('main', sourceId)];
+  let conflict = false, laterStage = false;
+  for (const entry of Object.values(snapshots ?? {})) {
+    if (!lifecycleTurn || !eligible(entry) || !entry.lifecycle_turn_id || entry.lifecycle_turn_id === lifecycleTurn) continue;
+    // A display staged after the pending Stop cannot displace that Stop's own matching final.
+    if (previouslyPending && !entry.conflicting_stop_usage) continue;
+    const observed = entry.conflicting_stop_usage ?? entry.usage;
+    if (current && prior?.accounting_basis === CLAUDE_ACCOUNTING_BASIS && deltaUsage(observed, prior.usage)?.consistent) continue;
+    if (owner && owner.usage.total_tokens < entry.usage.total_tokens && deltaUsage(owner.usage, entry.usage)?.consistent) {
+      laterStage = true;
+      continue;
+    }
+    conflict = true;
+    if (current && !transcript.rebaseline && !transcript.truncated) {
+      entry.conflicting_stop_usage = deltaUsage(observed, current)?.consistent ? tokenFields(current) : observed;
+    }
+  }
+  if (conflict) return { ...transcript, unreadable: true, reason: 'source-mismatch' };
+  if (!owner) return transcript;
+  delete snapshots[key];
+  if (laterStage) return stagedClaudeSnapshotSource(owner);
+  const observed = owner.conflicting_stop_usage;
+  if (!observed || transcript.rebaseline) return current ? transcript : stagedClaudeSnapshotSource(owner);
+  const coversObserved = current && !transcript.truncated && deltaUsage(observed, current)?.consistent;
+  if (coversObserved && USAGE_KEYS.every((k) => current[k] === owner.usage[k])) return transcript;
+  // Credit only the display. Commit the furthest observed cumulative counters so the next turn cannot inherit the gap.
+  const source = coversObserved ? transcript : stagedClaudeSnapshotSource({ ...owner, usage: observed });
+  return { ...source, staged_final_message: true, attributable_usage: owner.usage };
 }
 
 function clearClaudeFinalSnapshots(state, session, generation) {
   if (!state.claude_final_snapshots || !session) return;
   for (const [turnId, entry] of Object.entries(state.claude_final_snapshots)) {
-    if (entry?.session === session && entry.session_generation === generation) delete state.claude_final_snapshots[turnId];
+    if (entry?.session === session && entry.session_generation === generation) discardClaudeFinalSnapshot(state, turnId);
   }
 }
 
-function invalidateClaudeFinalSnapshots(state, input, eventName) {
-  if (!CLAUDE_FINAL_SNAPSHOT_INVALIDATING_EVENTS.has(eventName)) return;
+function invalidateClaudeFinalSnapshots(state, input) {
   const generation = sessionGeneration(state, input, 'claude');
   const session = sessionIdentity('claude', input?.session_id);
   if (!session) return;
   const suppliedTurn = safeOpaqueHostIdentifier(input?.turn_id);
   const sourceId = sourceIdentity('claude', input?.session_id, 'main', generation);
-  if (suppliedTurn && sourceId) {
-    const turnId = turnIdentity('claude', input?.session_id, suppliedTurn, generation, 'main', sourceId);
-    if (turnId) delete state.claude_final_snapshots?.[turnId];
-    const lifecycleTurn = lifecycleTurnIdentity('claude', input?.session_id, suppliedTurn);
-    for (const [key, entry] of Object.entries(state.claude_final_snapshots ?? {})) {
-      if (entry?.session === session
-        && entry.session_generation === generation
-        && entry.lifecycle_turn_id === lifecycleTurn) delete state.claude_final_snapshots[key];
-    }
-    return;
-  }
-  // An unscoped tool event cannot safely be assigned to a staged main turn.
-  // Drop only its session/generation candidates rather than risk a stale
-  // final-message snapshot crossing an unknown tool boundary.
-  clearClaudeFinalSnapshots(state, session, generation);
+  invalidateClaudeFinalSnapshotsBySafeContext(state, session, generation, suppliedTurn && sourceId ? {
+    turn_id: turnIdentity('claude', input.session_id, suppliedTurn, generation, 'main', sourceId),
+    lifecycle_turn_id: lifecycleTurnIdentity('claude', input.session_id, suppliedTurn),
+  } : null);
 }
 
 function invalidateClaudeFinalSnapshotsBySafeContext(state, session, generation, invalidation) {
@@ -639,13 +656,13 @@ function invalidateClaudeFinalSnapshotsBySafeContext(state, session, generation,
     return;
   }
   if (typeof invalidation.turn_id === 'string' && /^[a-f0-9]{20}$/.test(invalidation.turn_id)) {
-    delete state.claude_final_snapshots[invalidation.turn_id];
+    discardClaudeFinalSnapshot(state, invalidation.turn_id);
   }
   if (typeof invalidation.lifecycle_turn_id === 'string' && /^[a-f0-9]{20}$/.test(invalidation.lifecycle_turn_id)) {
     for (const [key, entry] of Object.entries(state.claude_final_snapshots)) {
       if (entry?.session === session
         && entry.session_generation === generation
-        && entry.lifecycle_turn_id === invalidation.lifecycle_turn_id) delete state.claude_final_snapshots[key];
+        && entry.lifecycle_turn_id === invalidation.lifecycle_turn_id) discardClaudeFinalSnapshot(state, key);
     }
   }
 }
@@ -729,11 +746,12 @@ function updateThread(state, key, transcriptPath, sourceId, sourceOverride = nul
   incrementHealth(state, 'token_events_seen', snapshotCount(parsed));
   incrementHealth(state, 'malformed_events', parsed.malformed);
   if (source.unreadable || !parsed.latest) {
-    return { valid: false, ambiguous: false, reason: source.unreadable ? 'transcript-unavailable' : 'unsupported-transcript', metadata: prior?.metadata, ponytail: parsed.ponytail };
+    const reason = source.reason ?? (source.unreadable ? 'transcript-unavailable' : 'unsupported-transcript');
+    return { valid: false, ambiguous: reason === 'source-mismatch', reason, metadata: prior?.metadata, ponytail: parsed.ponytail };
   }
   const current = parsed.latest.usage;
   const previous = identity.baseline ?? prior?.usage;
-  const delta = deltaUsage(previous, current);
+  const delta = deltaUsage(previous, source.attributable_usage ?? current);
   const reset = Boolean(previous && delta === null);
   const compactionBoundary = parsed.compactions > (prior?.compaction_count ?? 0);
   // Only a read that commits the thread moves its checkpoint; a staged source keeps it.
@@ -810,6 +828,19 @@ function ensureTurn(state, turnHash) {
     updated_at: timestamp(),
   };
   return state.turns[turnHash];
+}
+
+function ensureStopTurn(state, input, snapshot, runtime) {
+  const turnHash = laterClaudeTurn(state, input, stopTurnIdentity(state, input, snapshot, runtime), runtime);
+  const turn = state.turns[turnHash];
+  // A retained receipt can outlive the details required to update its usage.
+  if (!turn?.receipt && safeOpaqueHostIdentifier(input?.session_id) && safeOpaqueHostIdentifier(input?.turn_id)
+    && state.receipts.some((receipt) => receipt.turn_id === turnHash)) {
+    incrementHealth(state, 'duplicate_hooks');
+    incrementHealth(state, 'duplicate_events');
+    return null;
+  }
+  return turn ?? ensureTurn(state, turnHash);
 }
 
 function ensureScope(state, scopeHash) {
@@ -1821,8 +1852,8 @@ function stopFailureCategory(input) {
 function responseForStopFailure(state, input, runtime = 'codex', efficiency = null) {
   const mainKey = threadIdentity('main', sourceIdentity(runtime, input.session_id, 'main', sessionGeneration(state, input, runtime)));
   const snapshot = readSnapshots(input.transcript_path, runtime, state.threads[mainKey]?.checkpoint);
-  const turnHash = laterClaudeTurn(state, input, stopTurnIdentity(state, input, snapshot, runtime), runtime);
-  const turn = ensureTurn(state, turnHash);
+  const turn = ensureStopTurn(state, input, snapshot, runtime);
+  if (!turn) return {};
   if (turn.receipt) {
     incrementHealth(state, 'duplicate_hooks');
     incrementHealth(state, 'duplicate_events');
@@ -1849,7 +1880,7 @@ function responseForStopFailure(state, input, runtime = 'codex', efficiency = nu
   const generation = sessionGeneration(state, input, runtime);
   const receipt = {
     schema_version: SCHEMA_VERSION,
-    turn_id: turnHash,
+    turn_id: turn.turn_id,
     ...(sessionIdentity(runtime, input.session_id) ? { session: sessionIdentity(runtime, input.session_id) } : {}),
     ...(generation > 0 ? { session_generation: generation } : {}),
     status: 'unavailable',
@@ -1918,10 +1949,11 @@ function foldContinuedStop(state, input, runtime, env, turn, receipt, { mainKey,
   let usage = null, ambiguous = true;
   if (preferredStructured) [usage, ambiguous] = [preferredStructured, false];
   else if (mainKey && mainSourceId) {
-    const main = updateThread(state, mainKey, input.transcript_path, mainSourceId, snapshot, { runtime, session_id: input.session_id, turn_id: input.turn_id });
+    const source = runtime === 'claude' ? claudeStopSnapshot(state, input, turn.turn_id, snapshot) : snapshot;
+    const main = updateThread(state, mainKey, input.transcript_path, mainSourceId, source, { runtime, session_id: input.session_id, turn_id: input.turn_id });
     if (main.valid) {
       usage = main.usage_source === 'codex_structured_ledger' ? main.delta : sumUsage([turn.main.usage, main.delta]);
-      ambiguous = Boolean(main.ambiguous) || finalWait === 'timed_out';
+      ambiguous = Boolean(main.ambiguous) || source.staged_final_message === true || finalWait === 'timed_out';
     }
   }
   // A continuation that cannot be read keeps the first part as a lower bound.
@@ -1941,8 +1973,9 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   const mainSourceId = sourceIdentity(runtime, input.session_id, 'main', generation);
   const mainKey = threadIdentity('main', mainSourceId);
   const snapshot = preferredStructured?{unreadable:true,truncated:false,parsed:parseTokenSnapshots('')}:readSnapshots(input.transcript_path, runtime, state.threads[mainKey]?.checkpoint);
-  const turnHash = laterClaudeTurn(state, input, stopTurnIdentity(state, input, snapshot, runtime), runtime);
-  const turn = ensureTurn(state, turnHash);
+  const turn = ensureStopTurn(state, input, snapshot, runtime);
+  if (!turn) return {};
+  const turnHash = turn.turn_id;
   if (turn.receipt) {
     if (structuredUsage && turn.receipt.telemetry_reconciliation?.state === 'pending_post_turn') {
       const receipt = state.receipts.find((entry) => entry?.turn_id === turnHash) ?? turn.receipt;
@@ -1972,10 +2005,7 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   // readable transcript, but otherwise consume one matching staged numeric
   // snapshot. The staged route is deliberately partial because the display
   // lifecycle alone cannot prove that no later model work occurred.
-  const stagedSnapshot = runtime === 'claude' ? takeClaudeFinalSnapshot(state, input, turnHash) : null;
-  const mainSnapshot = !snapshot.unreadable && snapshot.parsed?.latest
-    ? snapshot
-    : stagedSnapshot ?? snapshot;
+  const mainSnapshot = runtime === 'claude' ? claudeStopSnapshot(state, input, turnHash, snapshot) : snapshot;
   // Codex fires no subagent hook for an auto-review, and runs a spawned agent's SubagentStart in that
   // agent's own turn. Read their rollouts before updateThread commits the thread: work for this turn
   // changed them after that commit. Structured Stop usage (never seen on the maintainer's Mac) might
@@ -2036,7 +2066,8 @@ function responseForStop(state, input, runtime = 'codex', efficiency = null, env
   turn.main = {
     valid: mainValid,
     ambiguous: mainAmbiguous,
-    reason: mainValid ? undefined : main.reason,
+    reason: mainValid ? undefined : mainSnapshot.reason ?? main.reason,
+    ...(runtime === 'claude' && !mainValid ? { implicit_turn: !safeOpaqueHostIdentifier(input.turn_id) } : {}),
     ...(mainUsage ? { usage: tokenFields(mainUsage) } : {}),
     ...(mainSourceId ? { source_id: mainSourceId } : {}),
     model: safeModel(input.model),
@@ -2383,7 +2414,7 @@ function pendingClaudeReconciliationResult(outcome) {
   return { reconciled: false, outcome };
 }
 
-function reconcilePendingClaudeTranscript(state, input, env = {}) {
+function reconcilePendingClaudeTranscript(state, input, env, eventName) {
   const sessionHash = sessionIdentity('claude', input?.session_id);
   if (!sessionHash || typeof input?.transcript_path !== 'string' || input.transcript_path.length === 0) {
     return { reconciled: false, outcome: 'session_closed_without_usage' };
@@ -2395,12 +2426,13 @@ function reconcilePendingClaudeTranscript(state, input, env = {}) {
   // transcript belongs to that turn (an existing monotonic baseline or the
   // session's first submitted prompt). Multiple pending turns and failures
   // remain unavailable instead of guessing a cross-turn attribution.
-  const pending = state.receipts.filter((entry) => entry?.session === sessionHash
-    && (Number.isSafeInteger(entry.session_generation) ? entry.session_generation : 0) === generation
-    && entry.telemetry_reconciliation?.state === 'pending_post_turn'
+  const receipts = state.receipts.filter((entry) => entry?.session === sessionHash
+    && (Number.isSafeInteger(entry.session_generation) ? entry.session_generation : 0) === generation);
+  const pending = receipts.filter((entry) => entry.telemetry_reconciliation?.state === 'pending_post_turn'
     && entry.reason !== 'stop_failure');
   if (pending.length === 0) return { reconciled: false };
-  if (pending.length !== 1) return { reconciled: false, outcome: 'ambiguous_pending_turns' };
+  // A cumulative transcript cannot recover an older turn across a later Stop.
+  if (pending.length !== 1 || pending[0] !== receipts.at(-1)) return pendingClaudeReconciliationResult('ambiguous_pending_turns');
 
   const receipt = pending[0];
   // A reset has already replaced the baseline; it cannot prove this turn's
@@ -2409,6 +2441,27 @@ function reconcilePendingClaudeTranscript(state, input, env = {}) {
   const turn = state.turns?.[receipt.turn_id];
   const mainSourceId = sourceIdentity('claude', input.session_id, 'main', generation);
   if (!turn || !mainSourceId || turn.main?.source_id !== mainSourceId) {
+    return pendingClaudeReconciliationResult('transcript_ambiguous');
+  }
+
+  if (eventName === 'MessageDisplay') {
+    const hostTurn = safeOpaqueHostIdentifier(input.turn_id);
+    const displayTurn = hostTurn && turnIdentity('claude', input.session_id, hostTurn, generation, 'main', mainSourceId);
+    const fallback = claudeFallbackTurnId(state, input);
+    const matchesFallback = receipt.turn_id === turnIdentity('claude', input.session_id, fallback, generation, 'main', mainSourceId);
+    // An older explicit Stop can literally be named like the fallback. Its scope survives reopening, but can be pruned.
+    const implicit = turn.main.implicit_turn ?? (matchesFallback && !state.health.state_retention_drops
+      && !state.scopes[scopeIdentity('claude', input.session_id, fallback, generation)]);
+    if (implicit) {
+      if (generation > 0 || !matchesFallback) return pendingClaudeReconciliationResult('transcript_ambiguous');
+    } else if (!displayTurn || receipt.turn_id !== displayTurn) {
+      if (hostTurn && turn.main.reason !== 'source-mismatch') turn.main.reason = 'display-turn-mismatch';
+      // A delayed final for an already accounted turn cannot reserve the pending turn's counters.
+      const settled = displayTurn && receipts.some((r) => r.turn_id === displayTurn && r.telemetry_reconciliation?.state === 'received');
+      return { reconciled: false, outcome: 'transcript_ambiguous', skip_stage: Boolean(settled) };
+    }
+  } else if (turn.main.reason === 'source-mismatch' || turn.main.reason === 'display-turn-mismatch') {
+    // An unscoped SessionEnd cannot resolve an explicit conflict, even after the staged display expires.
     return pendingClaudeReconciliationResult('transcript_ambiguous');
   }
 
@@ -2423,13 +2476,19 @@ function reconcilePendingClaudeTranscript(state, input, env = {}) {
     return pendingClaudeReconciliationResult('ambiguous_pending_turns');
   }
 
-  const result = updateThread(state, key, input.transcript_path, mainSourceId, source, { runtime: 'claude', session_id: input.session_id });
+  const snapshot = eventName === 'MessageDisplay' && safeOpaqueHostIdentifier(input.turn_id)
+    ? claudeStopSnapshot(state, input, receipt.turn_id, source, { previouslyPending: turn.main.reason !== 'source-mismatch' }) : source;
+  if (snapshot.reason === 'source-mismatch') {
+    turn.main.reason = 'source-mismatch';
+    return { reconciled: false, outcome: 'transcript_ambiguous', skip_stage: true };
+  }
+  const result = updateThread(state, key, input.transcript_path, mainSourceId, snapshot, { runtime: 'claude', session_id: input.session_id });
   if (!result.valid || !result.delta) {
     return pendingClaudeReconciliationResult(telemetryOutcomeForReason(result.reason));
   }
   reconcilePendingReceipt(state, turn, receipt, input, 'claude', result.delta, env, {
     source: 'transcript',
-    ambiguous: result.ambiguous,
+    ambiguous: result.ambiguous || snapshot.staged_final_message === true,
   });
   return { reconciled: true, outcome: 'received' };
 }
@@ -2444,7 +2503,7 @@ function reconcileSession(state, input, runtime = 'codex', env = {}) {
     ? state.advisor?.sessions?.[advisorSessionKey]?.closed_at !== null && state.advisor?.sessions?.[advisorSessionKey]?.closed_at !== undefined
     : false;
   const reconciliation = runtime === 'claude'
-    ? reconcilePendingClaudeTranscript(state, input, env)
+    ? reconcilePendingClaudeTranscript(state, input, env, 'SessionEnd')
     : null;
   finalizePendingTelemetry(state, sessionHash, generation, reconciliation?.outcome);
   const receipts = state.receipts.filter((entry) => entry?.session === sessionHash
@@ -2880,7 +2939,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
       const quotaSnapshot = recordQuotaSnapshot(state, input ?? {});
       const thresholdWarnings = recordUsageThresholdAlerts(state, quotaSnapshot);
       const efficiency = recordEfficiencyEvent(state, input ?? {}, name, runtime, { acceptance, normalized: normalizedEvent });
-      if (runtime === 'claude' && name !== 'MessageDisplay') invalidateClaudeFinalSnapshots(state, input ?? {}, name);
+      if (runtime === 'claude' && CLAUDE_FINAL_SNAPSHOT_INVALIDATING_EVENTS.has(name)) invalidateClaudeFinalSnapshots(state, input ?? {});
       let response = {};
       // A final Claude MessageDisplay can need durable private state so Stop
       // can consume its numeric stage, but a stage alone creates no public
@@ -2914,10 +2973,12 @@ export async function handleHook(input, eventName, env = process.env, deferred =
           'transcript_ambiguous',
         );
       }
-      else if (name === 'MessageDisplay' && runtime === 'claude' && normalizedEvent.final === true && !efficiency?.late_event) {
-        const stagedTurn = stageClaudeFinalSnapshot(state, input ?? {});
-        const reconciliation = reconcilePendingClaudeTranscript(state, input ?? {}, hookEnv);
-        if (reconciliation.reconciled === true && stagedTurn) delete state.claude_final_snapshots?.[stagedTurn];
+      // Claude marks subagent and --agent displays by the presence of agent_id.
+      else if (name === 'MessageDisplay' && runtime === 'claude' && normalizedEvent.final === true && !efficiency?.late_event
+        && !Object.hasOwn(input ?? {}, 'agent_id')) {
+        const reconciliation = reconcilePendingClaudeTranscript(state, input ?? {}, hookEnv, name);
+        if (reconciliation.reconciled) invalidateClaudeFinalSnapshots(state, input ?? {});
+        else if (!reconciliation.skip_stage) stageClaudeFinalSnapshot(state, input ?? {});
         publishPublicBridge = reconciliation.reconciled === true;
       }
       else if (name === 'Stop' && !efficiency?.late_event) response = responseForStop(state, input ?? {}, runtime, efficiency, hookEnv, thresholdWarnings, finalWait);
@@ -2986,7 +3047,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
       // Counted and saved above; a marker that cannot be removed is counted again by a later hook.
       for (const marker of missed) try { fs.rmSync(path.join(stateDir, marker), { force: true }); } catch { /* see above */ }
       return response;
-    });
+    }, name);
   } catch (error) {
     if (error?.message === 'state-lock-timeout') recordLockTimeout(stateDir, runtime);
     return {};
@@ -3043,6 +3104,8 @@ export async function mutateLimitRecoveryState(env = process.env, operation) {
       state.limit_recovery = trimLimitRecoveryState(state.limit_recovery);
       const previousLimitRecoveryState = state.limit_recovery.state;
       const result = await operation(state.limit_recovery, state);
+      // A refused checkpoint must not commit incidental state or public-report changes.
+      if (result?.ok === false) return result;
       state.limit_recovery = trimLimitRecoveryState(state.limit_recovery);
       recordLimitRecoveryTransitionHealth(state, previousLimitRecoveryState, state.limit_recovery);
       const bridgeWritten = writePublicBridge({

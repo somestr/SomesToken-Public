@@ -276,9 +276,9 @@ export function ensureStateDirectory(stateDir) {
 // counts as busy, so callers keep the bounded wait and the timeout accounting.
 export const tryFileLock = (lock) => { try { return acquireFileLock(lock); } catch { return null; } };
 
-async function withFileLock(stateDir, operation) {
+async function withFileLock(stateDir, operation, timeoutMs) {
   const lock = path.join(stateDir, LOCK_FILE);
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   let held;
   while (Date.now() < deadline) {
     held = tryFileLock(lock);
@@ -290,20 +290,22 @@ async function withFileLock(stateDir, operation) {
   finally { releaseFileLock(lock, held); }
 }
 
-export async function withLock(stateDir, operation) {
+export async function withLock(stateDir, operation, eventName) {
   ensureStateDirectory(stateDir);
+  // Receipt boundaries can outlast observed one-second holds; other callers keep the shorter wait.
+  const timeoutMs = eventName === 'Stop' || eventName === 'StopFailure' ? 2_000 : LOCK_TIMEOUT_MS;
   const prior = LOCAL_LOCK_TAILS.get(stateDir);
   if (!prior && LOCAL_LOCK_TAILS.size >= LOCAL_LOCK_TAIL_LIMIT) {
     // Do not grow an in-process queue without bound. This path retains the
     // original cross-process lock and fail-open timeout semantics.
-    return withFileLock(stateDir, operation);
+    return withFileLock(stateDir, operation, timeoutMs);
   }
   let release;
   const current = new Promise((resolve) => { release = resolve; });
   LOCAL_LOCK_TAILS.set(stateDir, current);
   try {
     if (prior) await prior;
-    return await withFileLock(stateDir, operation);
+    return await withFileLock(stateDir, operation, timeoutMs);
   } finally {
     release();
     if (LOCAL_LOCK_TAILS.get(stateDir) === current) LOCAL_LOCK_TAILS.delete(stateDir);
