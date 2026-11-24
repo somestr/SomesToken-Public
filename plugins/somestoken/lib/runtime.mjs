@@ -2855,14 +2855,52 @@ function saveHotContext(stateDir, state, runtime) {
   }
 }
 
-// A hook that timed out on the state lock counts itself only if it can take the lock right away. While the lock
-// stays busy it leaves a marker instead, which the next hook holding the lock counts and removes. Before this, a
-// single retry dropped the count: on 2026-11-09 a Claude Stop lost the lock under machine load, stored nothing, and
-// lock_timeouts did not move.
-// ponytail: at most MAX_MISSED_LOCKS markers wait; a timeout while that many wait is not counted.
-const MISSED_LOCK = /^missed-lock-[0-9a-f-]{36}$/, MAX_MISSED_LOCKS = 1000;
+// A hook that still cannot record its timeout leaves a private marker for the next lock holder.
+// shortcut: once MAX_MISSED_LOCKS markers are waiting, additional queued timeouts are dropped.
+const MISSED_LOCK = /^missed-lock-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:\.(0|[1-9]\d{0,6}))?$/, MAX_MISSED_LOCKS = 1000;
 function missedLocks(stateDir) {
-  try { return fs.readdirSync(stateDir).filter((name) => MISSED_LOCK.test(name)); } catch { return []; }
+  try {
+    return fs.readdirSync(stateDir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && MISSED_LOCK.test(entry.name)).map(entry => entry.name);
+  } catch { return null; }
+}
+
+// Both writers fold pending markers before incrementing the counter. The suffix records its
+// value before the save, so retrying an interrupted cleanup cannot count a marker twice.
+function countMissedLocks(stateDir, state) {
+  const names = missedLocks(stateDir);
+  if (!names) return null;
+  const before = state.health.lock_timeouts;
+  const retire = [];
+  let pending = 0;
+  for (const name of names) {
+    let file = path.join(stateDir, name);
+    const suffix = MISSED_LOCK.exec(name)[1];
+    if (suffix !== undefined && Number(suffix) > before) continue;
+    try {
+      const owned = fs.lstatSync(file);
+      if (!owned.isFile() || owned.size !== 0) continue;
+      if (suffix === undefined) {
+        const tagged = `${file}.${before}`;
+        if (fs.lstatSync(tagged, { throwIfNoEntry: false })) continue;
+        fs.renameSync(file, tagged);
+        file = tagged;
+      }
+      if (suffix === undefined || Number(suffix) === before) pending++;
+      retire.push({ file, owned });
+    } catch (error) {
+      // Advancing past an unreadable member of this batch would lose that timeout.
+      if (Number(suffix) === before && error.code !== 'ENOENT') return null;
+    }
+  }
+  incrementHealth(state, 'lock_timeouts', pending);
+  return retire;
+}
+
+function retireMissedLocks(markers) {
+  for (const { file, owned } of markers) {
+    try { unlinkOwnedFile(file, owned); } catch { /* The saved counter already covers this marker. */ }
+  }
 }
 
 function recordLockTimeout(stateDir, runtime = 'unknown') {
@@ -2871,18 +2909,21 @@ function recordLockTimeout(stateDir, runtime = 'unknown') {
   try {
     ensureStateDirectory(stateDir);
     held = tryFileLock(lock);
-    if (!held) {
-      if (missedLocks(stateDir).length < MAX_MISSED_LOCKS) {
+    const state = held ? loadState(stateDir, runtime) : null;
+    const missed = state && countMissedLocks(stateDir, state);
+    if (!missed) {
+      const waiting = missedLocks(stateDir);
+      if (waiting && waiting.length < MAX_MISSED_LOCKS) {
         fs.writeFileSync(path.join(stateDir, `missed-lock-${randomUUID()}`), '', { flag: 'wx', mode: 0o600 });
       }
       return;
     }
-    const state = loadState(stateDir, runtime);
     incrementHealth(state, 'lock_timeouts');
     saveState(stateDir, state);
+    retireMissedLocks(missed);
     saveHotContext(stateDir, state, runtime);
   } catch {
-    // A concurrent writer still owns the lock; do not race or block Codex.
+    // Recording a timeout is best effort when private storage is unavailable.
   } finally {
     if (held) releaseFileLock(lock, held);
   }
@@ -2918,8 +2959,7 @@ export async function handleHook(input, eventName, env = process.env, deferred =
   try {
     return await withLock(stateDir, async () => {
       const state = loadState(stateDir, runtime, { preserveLimitRecovery: name === 'SessionEnd' });
-      const missed = missedLocks(stateDir);
-      incrementHealth(state, 'lock_timeouts', missed.length);
+      const missed = countMissedLocks(stateDir, state) ?? [];
       const deferredHotEvents = drainDeferredHotEvents(stateDir, state, runtime);
       const advisorRetention = expireAdvisorState(state.advisor, timestamp());
       if (advisorRetention.dropped > 0) {
@@ -3041,11 +3081,10 @@ export async function handleHook(input, eventName, env = process.env, deferred =
         const bridgeWritten = writePublicBridge({ ...hookEnv, SOMESTOKEN_RUNTIME: runtime }, state);
         incrementHealth(state, bridgeWritten ? 'public_snapshots_written' : 'public_snapshot_write_failures');
       }
-      saveState(stateDir, state, { durable: durableState });
+      saveState(stateDir, state, { durable: durableState || missed.length > 0 });
+      retireMissedLocks(missed);
       if (deferredHotEvents.should_reset) resetHotEvents(stateDir, deferredHotEvents.epoch);
       saveHotContext(stateDir, state, runtime);
-      // Counted and saved above; a marker that cannot be removed is counted again by a later hook.
-      for (const marker of missed) try { fs.rmSync(path.join(stateDir, marker), { force: true }); } catch { /* see above */ }
       return response;
     }, name);
   } catch (error) {
