@@ -41,7 +41,7 @@ These points are covered by a private automated test suite that uses synthetic d
 - **Busy receipt state.** A Stop hook waits up to 2 seconds for another writer to release the receipt-state lock. If it stays busy, the turn can have no receipt and a later receipt can include its usage.
 - **Conversations without per-response usage.** Some Codex Desktop threads (seen with 0.166) store a conversation without per-response usage. SomesToken does not count them and names the gap `legacy_context_unavailable`.
 - **Archived Codex sessions.** The collector reads `~/.codex/sessions` only. Archiving a session in Codex moves its file to `~/.codex/archived_sessions`: usage already collected stays in your history, usage the collector had not read yet is not counted, and sessions archived before you opted in are never read.
-- **Effortless Codex updates.** Codex 0.164 asks you to approve SomesToken's 11 hooks again after every install or update. The Codex desktop app can skip changed hooks without offering a way to approve them ([openai/codex#37362](https://github.com/openai/codex/issues/37362)); approve them in the Codex CLI instead: run `codex`, open `/hooks`, approve and quit.
+- **Codex hook approval after a SomesToken update.** Updating SomesToken changes the plugin fingerprint. Codex Desktop can show **Hook failed** while the new hooks are marked `modified`. Run `npm run setup -- --verify` to check the installed version and its 11 hooks. If it asks for a review, run `codex` in a terminal and open `/hooks`. [Codex Desktop tracking issue](https://github.com/openai/codex/issues/37362)
 
 ## Requirements
 
@@ -64,14 +64,15 @@ Keep the folder on your startup disk, outside Desktop, Documents and Downloads (
 
 ```sh
 npm run setup -- --check
-npm run setup -- --apply
 ```
 
-Approve the SomesToken hooks in Codex (`/hooks`) and enable the plugin when prompted, then run:
+If setup reports `install_required` or `update_required`, run `npm run setup -- --apply`. For `enable_required`, enable the plugin in Codex. Then verify approval for this checkout.
 
 ```sh
 npm run setup -- --verify
 ```
+
+`ready` confirms the installed version and all 11 hooks are trusted and enabled. If Codex reports outstanding hooks or cannot read their status, run `codex` in a terminal and open `/hooks` to review them.
 
 **Claude Code:**
 

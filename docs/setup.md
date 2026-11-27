@@ -27,15 +27,19 @@ If the result says `install_required` or `update_required`, install the local pa
 npm run setup -- --apply
 ```
 
-Then approve the SomesToken hooks in Codex (`/hooks`) and enable the plugin when prompted. Codex 0.164 fingerprints the whole plugin folder, so it asks again after every install or update; until you approve, Codex skips the SomesToken hooks. The Codex desktop app can skip changed hooks without offering a way to approve them ([openai/codex#37362](https://github.com/openai/codex/issues/37362)); approve them in the Codex CLI instead: run `codex`, open `/hooks`, approve the SomesToken hooks and quit.
+After adding the plugin, `--apply` checks that Codex lists `somestoken@somestoken-local` as installed and enabled at this checkout’s exact version. Only then does it ask you to review hooks. If setup exits with code 1 after adding the plugin, follow the reported installation or inventory step.
 
-Verify the package and the observed installation:
+For `enable_required`, enable the plugin in Codex. Once the installed version matches the checkout, `--check` reports package state `ready` and lists hook approval separately under `hook_trust`. To verify both for this checkout, run
 
 ```sh
 npm run setup -- --verify
 ```
 
-The automated check cannot approve hooks or prove Desktop behavior. A normal completed task, followed by the diagnostics below, shows that collection works.
+`--verify` reports `ready` and exits with code 0 only when the installed plugin matches this checkout and Codex confirms all 11 hooks are trusted and enabled. For any other verification state, it exits with code 1 and sets `summary.ok` to `false` in JSON output.
+
+For `trust_required` or `hook_enable_required`, run `codex` in a terminal and enter `/hooks`. Review modified or untrusted SomesToken hooks and enable the ones you intend to use. Updates change the plugin fingerprint, and Codex Desktop can show **Hook failed** while approval is pending. [Codex Desktop tracking issue](https://github.com/openai/codex/issues/37362)
+
+Setup asks the running local Codex server for this checkout's hooks. If it cannot reach that server or confirm a complete inventory, `--verify` reports `unavailable`. Use the same menu for manual verification. A normal completed task followed by the diagnostics below verifies collection in the host you use.
 
 ## Claude Code
 
@@ -140,7 +144,7 @@ git pull --ff-only
 npm run build
 ```
 
-- **Codex:** run `npm run setup -- --check`, `npm run setup -- --apply` and `npm run setup -- --verify` again, and approve the SomesToken hooks in `/hooks` again.
+- **Codex** — run `npm run setup -- --check`. Apply a requested install or update, then run `npm run setup -- --verify`. Follow any hook review step it reports.
 - **Claude Code:**
 
   ```sh

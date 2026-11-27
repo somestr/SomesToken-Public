@@ -28,6 +28,7 @@ const REQUIRED_FILES = [
   'plugins/somestoken/lib/savings.mjs',
   'plugins/somestoken/lib/reporting.mjs',
   'scripts/lib/capabilities.mjs',
+  'scripts/lib/codex-hook-status.mjs',
   'plugins/somestoken/lib/routing.mjs',
   'plugins/somestoken/lib/usage/credits.mjs',
   'plugins/somestoken/lib/usage/config.mjs',

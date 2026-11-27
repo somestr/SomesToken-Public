@@ -38,10 +38,11 @@ const CLAUDE_HOOKS_FILE = path.join(PLUGIN_ROOT, 'hooks', 'claude-hooks.json');
 const CLAUDE_PLUGIN_ROOT = './plugins/somestoken';
 const COMMAND_TIMEOUT_MS = 30_000;
 const OUTPUT_LIMIT = 4096;
-const CLAUDE_INVENTORY_OUTPUT_LIMIT = 1024 * 1024;
+const INVENTORY_OUTPUT_LIMIT = 1024 * 1024;
+const DESKTOP_STEP = { name: 'desktop_surface', status: 'manual', detail: 'check that SomesToken is enabled in Codex Desktop' };
 const MANUAL_STEPS = [
-  { name: 'hook_trust', status: 'manual', detail: 'host review and trust flow required; no trust bypass used' },
-  { name: 'desktop_surface', status: 'manual', detail: 'desktop plugin and hook UI review remains host-owned' },
+  { name: 'hook_trust', status: 'manual', detail: 'run codex in a terminal, open /hooks, and review and approve any SomesToken hooks marked modified or untrusted' },
+  DESKTOP_STEP,
 ];
 const CLAUDE_RELOAD_STEP = { name: 'claude_reload', status: 'manual', detail: 'restart Claude Code or start a fresh session after plugin install/update/enable; this is required when in-session plugin reload is unavailable' };
 const CLAUDE_INSTALL_STEPS = [
@@ -69,7 +70,7 @@ function claudeManualSteps(state, scope) {
   return [check('claude_plugin_inventory', 'manual', 'run claude plugin list --json and inspect the exact somestoken@somestoken-local identity, version, enabled flag and scope before choosing an installation action; managed installations require administrator review')];
 }
 
-function summary(checks) {
+function summary(checks, mode, state) {
   const result = {
     pass: checks.filter((entry) => entry.status === 'pass').length,
     fail: checks.filter((entry) => entry.status === 'fail').length,
@@ -77,7 +78,9 @@ function summary(checks) {
     manual: checks.filter((entry) => entry.status === 'manual').length,
   };
   result.total = checks.length;
-  result.ok = result.fail === 0;
+  result.ok = result.fail === 0
+    && (mode !== 'verify' || state === 'ready')
+    && (mode !== 'apply' || state === 'trust_required');
   return result;
 }
 
@@ -206,13 +209,10 @@ function runCommand(command, args, root, env, marker) {
   };
 }
 
-function addManualChecks(checks) {
-  checks.push(...MANUAL_STEPS.map((entry) => ({ ...entry })));
-}
-
 function baseResult(fingerprint, checks, state, options = {}) {
   const host = options.host || 'codex';
-  const manualSteps = options.manualSteps || MANUAL_STEPS;
+  const manualSteps = options.manualSteps ?? checks.filter((entry) =>
+    entry.status !== 'pass' && MANUAL_STEPS.some((step) => step.name === entry.name));
   return {
     schema_version: SETUP_SCHEMA_VERSION,
     host,
@@ -222,7 +222,7 @@ function baseResult(fingerprint, checks, state, options = {}) {
     fingerprint,
     checks,
     manual_steps: manualSteps.map((entry) => entry.name),
-    summary: summary(checks),
+    summary: summary(checks, options.mode, state),
   };
 }
 
@@ -250,44 +250,79 @@ function codexVersionCheck(command, root, env, checks) {
  * changes an installation, or infers hook trust. A repository artifact can be
  * valid while Codex is still running an older installed version.
  */
-function installedCodexPluginCheck(command, root, env, checks, expectedVersion) {
+function installedCodexPluginCheck(command, root, env, expectedVersion) {
   const result = spawnSync(command, ['plugin', 'list', '--marketplace', MARKETPLACE_NAME, '--json'], {
     cwd: root,
     env,
     shell: false,
     encoding: 'utf8',
     timeout: COMMAND_TIMEOUT_MS,
-    maxBuffer: OUTPUT_LIMIT,
+    maxBuffer: INVENTORY_OUTPUT_LIMIT,
   });
-  if (result.error?.code === 'ENOENT' || result.status !== 0) {
-    checks.push(check('installed_plugin_identity', 'unavailable', 'installed plugin inventory is unavailable; repository package remains independently verified'));
-    return 'installation_unavailable';
+  if (result.error || result.status !== 0) {
+    return { state: 'installation_unavailable', status: 'unavailable', detail: 'Codex could not read the installed plugin inventory' };
   }
-  let payload;
+  let entry;
   try {
-    payload = JSON.parse(result.stdout ?? '');
+    const rows = JSON.parse(result.stdout ?? '').installed;
+    if (!Array.isArray(rows) || !rows.every((row) => typeof row?.name === 'string' && row.name.length > 0
+      && (row.name !== PLUGIN_NAME || (typeof row.marketplaceName === 'string' && row.marketplaceName.length > 0)))) {
+      throw new Error('invalid inventory');
+    }
+    const matches = rows.filter((row) => row.name === PLUGIN_NAME && row.marketplaceName === MARKETPLACE_NAME);
+    if (matches.length > 1) throw new Error('ambiguous installation');
+    [entry] = matches;
+    if (entry && typeof entry.installed !== 'boolean') throw new Error('missing install status');
+    if (entry?.pluginId !== undefined && entry.pluginId !== PLUGIN_NAME + '@' + MARKETPLACE_NAME) throw new Error('conflicting plugin identity');
+    if (entry?.installed && (typeof entry.enabled !== 'boolean' || !validVersion(entry.version))) throw new Error('invalid installed plugin');
   } catch {
-    checks.push(check('installed_plugin_identity', 'unavailable', 'installed plugin inventory is unreadable; repository package remains independently verified'));
-    return 'installation_unavailable';
+    return { state: 'installation_unavailable', status: 'unavailable', detail: 'Codex did not return a usable installation inventory' };
   }
-  const installed = Array.isArray(payload?.installed) ? payload.installed : [];
-  const entry = installed.find((candidate) => candidate
-    && candidate.name === PLUGIN_NAME
-    && candidate.marketplaceName === MARKETPLACE_NAME);
-  if (!entry || entry.installed !== true) {
-    checks.push(check('installed_plugin_identity', 'manual', 'SomesToken is not installed in the host inventory'));
-    return 'install_required';
+  if (!entry?.installed) {
+    return { state: 'install_required', status: 'manual', detail: 'SomesToken is not installed in the host inventory' };
   }
   if (entry.enabled !== true) {
-    checks.push(check('installed_plugin_identity', 'manual', 'SomesToken is installed but not enabled in the host inventory'));
-    return 'enable_required';
+    return { state: 'enable_required', status: 'manual', detail: 'SomesToken is installed but not enabled in the host inventory' };
   }
   if (entry.version !== expectedVersion) {
-    checks.push(check('installed_plugin_identity', 'manual', 'installed SomesToken version differs from the repository artifact'));
-    return 'update_required';
+    return { state: 'update_required', status: 'manual', detail: 'installed SomesToken version differs from the repository artifact' };
   }
-  checks.push(check('installed_plugin_identity', 'pass', 'installed SomesToken identity matches the repository artifact'));
-  return 'ready';
+  return { state: 'ready', status: 'pass', detail: 'installed SomesToken identity matches the repository artifact' };
+}
+
+export function confirmCodexInstallation(command, root, env, checks, expectedVersion) {
+  const { state, detail } = installedCodexPluginCheck(command, root, env, expectedVersion);
+  checks.push(check('plugin_discovery_after_install', state === 'ready' ? 'pass' : 'fail', detail));
+  return state;
+}
+
+function codexHookCheck(command, root, env, checks, expectedVersion) {
+  const helper = fileURLToPath(new URL('./lib/codex-hook-status.mjs', import.meta.url));
+  const result = spawnSync(process.execPath, [helper, command, expectedVersion], {
+    cwd: root, env, shell: false, encoding: 'utf8', timeout: 5_000, maxBuffer: OUTPUT_LIMIT,
+  });
+  let counts;
+  try {
+    if (result.error || result.status !== 0) throw new Error('hook inventory unavailable');
+    counts = JSON.parse(result.stdout);
+    if (counts?.total !== HOOK_EVENTS.length || ![counts.trusted, counts.disabled].every((n) =>
+      Number.isInteger(n) && n >= 0 && n <= counts.total)) throw new Error('invalid hook inventory');
+  } catch {
+    checks.push(check('hook_trust', 'unavailable', 'Codex could not verify hook approval. Run codex in a terminal and open /hooks to review SomesToken.'));
+    return 'unavailable';
+  }
+  const { total, trusted, disabled } = counts;
+  const pending = total - trusted;
+  const detail = [];
+  if (pending) detail.push(`${pending} modified or untrusted`);
+  if (disabled) detail.push(`${disabled} disabled`);
+  const status = pending || disabled ? 'manual' : 'pass';
+  const message = detail.length
+    ? `Of ${total} SomesToken hooks, Codex reports ${detail.join(' and ')}. Run codex in a terminal and open /hooks. Review pending approvals and enable the hooks you intend to use.`
+    : `Codex reports all ${total} SomesToken hooks trusted and enabled`;
+  checks.push({ ...check('hook_trust', status, message), total, trusted, disabled });
+  if (pending) return 'trust_required';
+  return disabled ? 'hook_enable_required' : 'ready';
 }
 
 function installedClaudePluginCheck(command, root, env, checks, expectedVersion) {
@@ -297,7 +332,7 @@ function installedClaudePluginCheck(command, root, env, checks, expectedVersion)
     shell: false,
     encoding: 'utf8',
     timeout: COMMAND_TIMEOUT_MS,
-    maxBuffer: CLAUDE_INVENTORY_OUTPUT_LIMIT,
+    maxBuffer: INVENTORY_OUTPUT_LIMIT,
   });
   if (result.error || result.status !== 0) {
     checks.push(check('claude_plugin_discovery', 'unavailable', 'Claude plugin inventory is unavailable; repository package remains independently verified'));
@@ -343,7 +378,7 @@ function installationStep(command, checks, name, args, root, env, marker) {
       ? 'Codex CLI is not installed'
       : 'Codex lifecycle command failed';
   checks.push(check(name, result.status, detail));
-  return result.status === 'pass';
+  return result.status === 'fail' ? 'blocked' : result.status;
 }
 
 function claudeObservation(command, checks, name, args, root, env, marker, passDetail, missingDetail) {
@@ -442,6 +477,7 @@ export function runSetup(options = {}) {
   if (host === 'claude') return runClaudeSetup(options, root, cwd, env);
   const checks = [];
   const inspected = inspectPackage(root);
+  const finish = (state) => baseResult(inspected.fingerprint, checks, state, { mode });
   checks.push(check(
     'repository_root',
     cwd === root ? 'pass' : 'fail',
@@ -449,23 +485,20 @@ export function runSetup(options = {}) {
   ));
   checks.push(...inspected.checks);
 
-  if (cwd !== root) return baseResult(inspected.fingerprint, checks, 'blocked');
-  if (checks.some((entry) => entry.status === 'fail')) return baseResult(inspected.fingerprint, checks, 'blocked');
+  if (cwd !== root) return finish('blocked');
+  if (checks.some((entry) => entry.status === 'fail')) return finish('blocked');
 
   const versionStatus = codexVersionCheck(codexCommand, root, env, checks);
-  if (versionStatus === 'unavailable') return baseResult(inspected.fingerprint, checks, 'unavailable');
-  if (versionStatus !== 'pass') return baseResult(inspected.fingerprint, checks, 'blocked');
+  if (versionStatus === 'unavailable') return finish('unavailable');
+  if (versionStatus !== 'pass') return finish('blocked');
 
-  if (mode === 'check') {
-    const installationState = installedCodexPluginCheck(codexCommand, root, env, checks, inspected.fingerprint.plugin_version);
-    addManualChecks(checks);
-    return baseResult(inspected.fingerprint, checks, installationState);
-  }
-
-  if (mode === 'verify') {
-    const discovered = installationStep(codexCommand, checks, 'plugin_discovery', ['plugin', 'list', '--marketplace', MARKETPLACE_NAME], root, env, PLUGIN_NAME);
-    addManualChecks(checks);
-    return baseResult(inspected.fingerprint, checks, discovered ? 'trust_required' : 'blocked');
+  if (mode === 'check' || mode === 'verify') {
+    const installation = installedCodexPluginCheck(codexCommand, root, env, inspected.fingerprint.plugin_version);
+    checks.push(check('installed_plugin_identity', installation.status, installation.detail));
+    if (installation.state !== 'ready') return finish(installation.state);
+    const hookState = codexHookCheck(codexCommand, root, env, checks, inspected.fingerprint.plugin_version);
+    checks.push({ ...DESKTOP_STEP });
+    return finish(mode === 'check' ? installation.state : hookState);
   }
 
   // Preserve compatibility registrations across the official installer's cache replacement.
@@ -483,47 +516,58 @@ export function runSetup(options = {}) {
   } catch (error) {
     if (error.code !== 'ENOENT') {
       checks.push(check('live_compatibility', 'fail', 'existing compatibility registration is invalid'));
-      return baseResult(inspected.fingerprint, checks, 'blocked');
+      return finish('blocked');
     }
   }
   const steps = [
     ['marketplace_add', ['plugin', 'marketplace', 'add', '.']],
     ['marketplace_discovery', ['plugin', 'marketplace', 'list'], MARKETPLACE_NAME],
     ['plugin_discovery', ['plugin', 'list', '--marketplace', MARKETPLACE_NAME], PLUGIN_NAME],
-    ['plugin_install', ['plugin', 'add', PLUGIN_NAME + '@' + MARKETPLACE_NAME]],
-    ['plugin_discovery_after_install', ['plugin', 'list', '--marketplace', MARKETPLACE_NAME], PLUGIN_NAME],
   ];
-  const liveOptions = { home: env.HOME || os.homedir(), codexHome, source: path.join(root, PLUGIN_ROOT), compat: compatibility || [] };
   for (const [name, args, marker] of steps) {
-    let recovery = null;
-    if (name === 'plugin_install' && compatibility !== null) {
-      try { recovery = prepareOfficialInstall(liveOptions); }
-      catch {
-        checks.push(check('live_compatibility', 'fail', 'compatibility preflight failed; official plugin install was not started'));
-        addManualChecks(checks);
-        return baseResult(inspected.fingerprint, checks, 'blocked');
-      }
-    }
-    if (!installationStep(codexCommand, checks, name, args, root, env, marker)) {
-      const restored = recovery?.rollback();
-      addManualChecks(checks);
-      return { ...baseResult(inspected.fingerprint, checks, checks.some((entry) => entry.status === 'unavailable') ? 'unavailable' : 'blocked'), ...(restored ? { live_update: { rollback_status: restored.rollback_status, active_version: restored.active_version } } : {}) };
-    }
-    if (recovery) {
-      try {
-        recovery.refresh();
-        recovery.commit();
-        checks.push(check('live_compatibility', 'pass', 'compatibility paths verified and refreshed; loaded MCP reload remains host-owned'));
-      } catch (error) {
-        const restored = recovery.rollback();
-        checks.push(check('live_compatibility', 'fail', 'official installation or compatibility refresh failed; previous installation recovery attempted'));
-        addManualChecks(checks);
-        return { ...baseResult(inspected.fingerprint, checks, 'blocked'), live_update: { rollback_status: error.result?.rollback_status === 'failed' ? 'failed' : restored.rollback_status, active_version: restored.active_version } };
-      }
+    const status = installationStep(codexCommand, checks, name, args, root, env, marker);
+    if (status !== 'pass') return finish(status);
+  }
+  let recovery;
+  if (compatibility !== null) {
+    try {
+      recovery = prepareOfficialInstall({ home: env.HOME || os.homedir(), codexHome, source: path.join(root, PLUGIN_ROOT), compat: compatibility });
+    } catch {
+      checks.push(check('live_compatibility', 'fail', 'compatibility preflight failed; official plugin install was not started'));
+      return finish('blocked');
     }
   }
-  addManualChecks(checks);
-  return baseResult(inspected.fingerprint, checks, 'trust_required');
+  const finishAfterRollback = (state, refreshError) => {
+    if (!recovery) return finish(state);
+    let restored;
+    try {
+      restored = recovery.rollback();
+    } catch {
+      // Recovery refuses to touch files when it cannot verify its lock or backup.
+    }
+    if (restored?.rollback_status !== 'restored' || refreshError?.result?.rollback_status === 'failed') {
+      checks.push(check('live_compatibility', 'fail', 'Could not confirm restoration of the previous managed installation. Inspect the recovery files before retrying.'));
+      return { ...finish('blocked'), live_update: { rollback_status: 'failed', active_version: null } };
+    }
+    if (refreshError) checks.push(check('live_compatibility', 'fail', 'Compatibility activation failed. The previous managed installation was restored.'));
+    return { ...finish(state), live_update: { rollback_status: 'restored', active_version: restored.active_version } };
+  };
+  const added = installationStep(codexCommand, checks, 'plugin_install', ['plugin', 'add', PLUGIN_NAME + '@' + MARKETPLACE_NAME], root, env);
+  const state = added === 'pass'
+    ? confirmCodexInstallation(codexCommand, root, env, checks, inspected.fingerprint.plugin_version)
+    : added;
+  if (state !== 'ready') return finishAfterRollback(state);
+  if (recovery) {
+    try {
+      recovery.refresh();
+      recovery.commit();
+      checks.push(check('live_compatibility', 'pass', 'compatibility paths verified and refreshed; loaded MCP reload remains host-owned'));
+    } catch (error) {
+      return finishAfterRollback('blocked', error);
+    }
+  }
+  checks.push(...MANUAL_STEPS.map((entry) => ({ ...entry })));
+  return finish('trust_required');
 }
 
 export function parseSetupArgs(argv = []) {
@@ -597,16 +641,19 @@ export function formatSetup(result, json = false) {
     ];
     return lines.join('\n') + '\n';
   }
+  const unconfirmed = result.checks.some((entry) => entry.name === 'plugin_discovery_after_install' && entry.status === 'fail');
+  const inspectInventory = result.state === 'installation_unavailable' || (unconfirmed && ['install_required', 'update_required'].includes(result.state));
   const lines = [
     'SomesToken setup · state=' + result.state,
     'Plugin ' + result.plugin.name + '@' + result.plugin.version + ' · marketplace ' + result.marketplace,
     'Artifact ' + (result.fingerprint.package_sha256 ?? 'unavailable') + ' · hooks ' + (result.fingerprint.hook_fingerprint ?? 'unavailable'),
-    ...result.checks.map((entry) => entry.status.toUpperCase() + ' ' + entry.name + ': ' + entry.detail),
-    ...(result.state === 'update_required' ? ['NEXT plugin_update: run npm run setup -- --apply, then review hook trust in Codex'] : []),
-    ...(result.state === 'install_required' ? ['NEXT plugin_install: run npm run setup -- --apply, then review hook trust in Codex'] : []),
-    ...(result.state === 'enable_required' ? ['NEXT plugin_enable: enable SomesToken in Codex, then review hook trust'] : []),
-    'NEXT hook_trust: review and trust SomesToken lifecycle hooks in the Codex host surface',
-    'NEXT desktop_surface: complete desktop plugin and hook review in the ChatGPT Codex surface',
+    ...result.checks.filter((entry) => !result.manual_steps.includes(entry.name))
+      .map((entry) => entry.status.toUpperCase() + ' ' + entry.name + ': ' + entry.detail),
+    ...(result.state === 'update_required' && !unconfirmed ? ['NEXT plugin_update: run npm run setup -- --apply'] : []),
+    ...(result.state === 'install_required' && !unconfirmed ? ['NEXT plugin_install: run npm run setup -- --apply'] : []),
+    ...(result.state === 'enable_required' ? ['NEXT plugin_enable: enable SomesToken in Codex, then run npm run setup -- --check'] : []),
+    ...(inspectInventory ? ['NEXT plugin_inventory: inspect codex plugin list --marketplace somestoken-local --json to check the installed version'] : []),
+    ...result.checks.filter((entry) => result.manual_steps.includes(entry.name)).map((entry) => 'NEXT ' + entry.name + ': ' + entry.detail),
     'SUMMARY pass=' + result.summary.pass + ' fail=' + result.summary.fail + ' unavailable=' + result.summary.unavailable + ' manual=' + result.summary.manual,
   ];
   return lines.join('\n') + '\n';
